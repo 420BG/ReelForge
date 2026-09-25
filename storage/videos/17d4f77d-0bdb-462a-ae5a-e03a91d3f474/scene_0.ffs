@@ -1,0 +1,1 @@
+[0:v]scale=1440:2560:force_original_aspect_ratio=increase,crop=1440:2560,zoompan=z='1+0.2*on/130':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=720x1280:fps=24,eq=saturation=1.1:contrast=1.06,vignette=PI/4,format=yuv420p[v];[1:a]apad=pad_dur=0.45,atrim=duration=5.38[a]
