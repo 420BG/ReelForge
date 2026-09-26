@@ -10,10 +10,18 @@ export async function middleware(req: NextRequest) {
     return NextResponse.next();
   }
 
-  // external cron ping may authenticate with its shared secret instead
+  // external cron ping may authenticate with its shared secret instead.
+  // Vercel's own Cron Jobs feature sends `Authorization: Bearer <CRON_SECRET>`
+  // automatically when CRON_SECRET is set — accept that, plus a custom
+  // `x-cron-secret` header for any external scheduler (cron-job.org, GitHub
+  // Actions, etc.) hitting the same route.
   if (pathname === "/api/cron") {
-    const secret = req.headers.get("x-cron-secret");
-    if (secret && secret === process.env.CRON_SECRET) return NextResponse.next();
+    const bearer = req.headers.get("authorization");
+    const custom = req.headers.get("x-cron-secret");
+    const expected = process.env.CRON_SECRET;
+    if (expected && (bearer === `Bearer ${expected}` || custom === expected)) {
+      return NextResponse.next();
+    }
   }
 
   const ok = await verifySessionValue(req.cookies.get(SESSION_COOKIE)?.value);
