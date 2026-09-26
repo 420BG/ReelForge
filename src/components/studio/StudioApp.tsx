@@ -207,29 +207,38 @@ export default function StudioApp() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ topic, niche, voice, style, format, autoUpload: autoUpload && yt.connected, privacy }),
       });
-      if (!res.ok) throw new Error();
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        throw new Error(body?.error || `request failed (${res.status})`);
+      }
       say("Forging started — watch the queue.");
       setTimeout(loadVideos, 800);
-    } catch {
-      say("Failed to queue the video.");
+    } catch (err) {
+      say(err instanceof Error ? err.message : "Failed to queue the video.");
     } finally {
       setForging(false);
     }
   };
 
   const createSeries = async () => {
-    const res = await fetch("/api/series", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        name: sName, niche: sNiche, format: sFormat, frequency: sFreq,
-        autopilot: sAutopilot, autoUpload: sUpload && yt.connected, privacy, voice, style,
-      }),
-    });
-    if (res.ok) {
+    try {
+      const res = await fetch("/api/series", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: sName, niche: sNiche, format: sFormat, frequency: sFreq,
+          autopilot: sAutopilot, autoUpload: sUpload && yt.connected, privacy, voice, style,
+        }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        throw new Error(body?.error || `request failed (${res.status})`);
+      }
       const d = await res.json();
       setSeries((s) => [d.series, ...s]);
       say(`Series "${sName}" armed.`);
+    } catch (err) {
+      say(err instanceof Error ? err.message : "Failed to create series.");
     }
   };
 
