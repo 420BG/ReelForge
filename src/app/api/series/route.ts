@@ -31,21 +31,29 @@ export async function POST(req: Request) {
   const autopilot = b.autopilot ? 1 : 0;
   const autoUpload = b.autoUpload ? 1 : 0;
 
-  const [row] = await db
-    .insert(series)
-    .values({
-      name,
-      niche,
-      voice,
-      style,
-      format,
-      frequency,
-      privacy,
-      autopilot,
-      autoUpload,
-      nextRunAt: nextRunFrom(frequency),
-    })
-    .returning();
+  try {
+    const [row] = await db
+      .insert(series)
+      .values({
+        name,
+        niche,
+        voice,
+        style,
+        format,
+        frequency,
+        privacy,
+        autopilot,
+        autoUpload,
+        nextRunAt: nextRunFrom(frequency),
+      })
+      .returning();
 
-  return Response.json({ ok: true, series: row });
+    return Response.json({ ok: true, series: row });
+  } catch (err) {
+    console.error("failed to create series:", err);
+    return Response.json(
+      { error: err instanceof Error ? err.message : "database insert failed" },
+      { status: 500 },
+    );
+  }
 }
