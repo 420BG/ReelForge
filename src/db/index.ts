@@ -16,6 +16,7 @@ export const pool =
   new Pool({
     connectionString: databaseUrl,
     ssl: { rejectUnauthorized: false },
+    max: 5, // serverless: keep this well under Supabase's pooler connection cap
   });
 
 if (process.env.NODE_ENV !== "production") {
