@@ -52,7 +52,12 @@ export async function POST(req: Request) {
   } catch (err) {
     console.error("failed to create series:", err);
     return Response.json(
-      { error: err instanceof Error ? err.message : "database insert failed" },
+      {
+        error:
+          err instanceof Error
+            ? (err.cause instanceof Error ? err.cause.message : err.message)
+            : "database insert failed",
+      },
       { status: 500 },
     );
   }
