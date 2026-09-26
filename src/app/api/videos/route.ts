@@ -33,20 +33,29 @@ export async function POST(req: Request) {
     : "private";
   const autoUpload = b.autoUpload ? 1 : 0;
 
-  const [v] = await db
-    .insert(videos)
-    .values({
-      topic,
-      title: `${topic} — forging…`,
-      niche,
-      voice,
-      style,
-      format,
-      privacy,
-      autoUpload,
-      status: "queued",
-    })
-    .returning({ id: videos.id });
+  let v: { id: string };
+  try {
+    [v] = await db
+      .insert(videos)
+      .values({
+        topic,
+        title: `${topic} — forging…`,
+        niche,
+        voice,
+        style,
+        format,
+        privacy,
+        autoUpload,
+        status: "queued",
+      })
+      .returning({ id: videos.id });
+  } catch (err) {
+    console.error("failed to queue video:", err);
+    return Response.json(
+      { error: err instanceof Error ? err.message : "database insert failed" },
+      { status: 500 },
+    );
+  }
 
   after(() => runPipeline(v.id).catch((err) => console.error("pipeline crashed", err)));
   return Response.json({ ok: true, videoId: v.id });
