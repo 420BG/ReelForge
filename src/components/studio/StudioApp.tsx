@@ -14,6 +14,7 @@ import {
   Layers,
   Timer,
   CheckCircle2,
+  Send,
 } from "lucide-react";
 import { NICHES, VOICES, STYLES } from "@/lib/generator";
 import { Logo } from "@/components/ui";
@@ -106,11 +107,35 @@ const chipCls = (on: boolean) =>
     on ? "border-lime/60 bg-lime/[0.08] text-cream" : "border-white/10 bg-white/[0.02] text-mute hover:text-cream"
   }`;
 
-function Field({ label, children }: { label: string; children: ReactNode }) {
+function Ask({ children }: { children: ReactNode }) {
   return (
-    <div>
-      <p className="mb-2 text-[10px] font-bold uppercase tracking-[0.2em] text-dim">{label}</p>
-      {children}
+    <div className="flex items-start gap-2.5">
+      <span className="mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-full bg-lime/15 text-lime">
+        <Zap className="h-3.5 w-3.5 fill-current" />
+      </span>
+      <p className="max-w-[85%] rounded-2xl rounded-tl-sm border border-white/[0.06] bg-white/[0.03] px-4 py-2.5 text-sm leading-relaxed text-mute">
+        {children}
+      </p>
+    </div>
+  );
+}
+
+function ChipRow({
+  options,
+  value,
+  onChange,
+}: {
+  options: { id: string; label: string }[];
+  value: string;
+  onChange: (v: string) => void;
+}) {
+  return (
+    <div className="ml-9.5 flex flex-wrap justify-end gap-1.5">
+      {options.map((o) => (
+        <button key={o.id} onClick={() => onChange(o.id)} className={chipCls(value === o.id)}>
+          {o.label}
+        </button>
+      ))}
     </div>
   );
 }
@@ -305,75 +330,95 @@ export default function StudioApp() {
         </div>
 
         <div className="grid gap-6 lg:grid-cols-2">
-          {/* forge one video */}
-          <section className="glass-deep rounded-3xl p-6 sm:p-7">
-            <div className="mb-5 flex items-center justify-between">
+          {/* forge one video — chat thread */}
+          <section className="glass-deep flex max-h-[720px] flex-col rounded-3xl p-6 sm:p-7">
+            <div className="mb-5 flex items-center gap-2.5">
               <h2 className="flex items-center gap-2 font-display text-lg font-bold">
                 <Zap className="h-4.5 w-4.5 text-lime" /> Forge one now
               </h2>
-              <div className="flex gap-1.5">
-                {(["short", "long"] as const).map((f) => (
-                  <button key={f} onClick={() => setFormat(f)} className={chipCls(format === f)}>
-                    {f === "short" ? "Short · 9:16" : "Long · 16:9"}
-                  </button>
-                ))}
-              </div>
+              <span className="ml-auto flex items-center gap-1.5 text-[11px] font-semibold text-dim">
+                <span className="h-1.5 w-1.5 rounded-full bg-lime" /> ready
+              </span>
             </div>
 
-            <div className="space-y-4">
-              <Field label="Topic">
-                <div className="flex gap-2">
-                  <input value={topic} onChange={(e) => setTopic(e.target.value)} maxLength={80} className={`${inputCls} flex-1`} placeholder="e.g. the Fermi paradox" />
-                  <button onClick={randomTopic} aria-label="Random" className="grid h-12 w-12 place-items-center rounded-xl border border-white/12 text-mute transition hover:border-lime/40 hover:text-lime">
-                    <Dices className="h-4.5 w-4.5" />
-                  </button>
-                </div>
-              </Field>
+            <div className="-mr-2 flex-1 space-y-4 overflow-y-auto pr-2">
+              <Ask>Short for the daily feed, or a long-form piece?</Ask>
+              <ChipRow
+                options={[
+                  { id: "short", label: "Short · 9:16" },
+                  { id: "long", label: "Long · 16:9" },
+                ]}
+                value={format}
+                onChange={(v) => setFormat(v as "short" | "long")}
+              />
 
-              <div className="grid grid-cols-2 gap-4">
-                <Field label="Niche">
-                  <select value={niche} onChange={(e) => setNiche(e.target.value)} className={`${inputCls} w-full appearance-none`}>
-                    {NICHES.map((n) => <option key={n.id} value={n.id} className="bg-ink">{n.label}</option>)}
-                    <option value="custom" className="bg-ink">Custom / anything</option>
-                  </select>
-                </Field>
-                <Field label="Narrator">
-                  <select value={voice} onChange={(e) => setVoice(e.target.value)} className={`${inputCls} w-full appearance-none`}>
-                    {VOICES.map((v) => <option key={v.id} value={v.id} className="bg-ink">{v.name} — {v.vibe}</option>)}
-                  </select>
-                </Field>
-                <Field label="Style">
-                  <select value={style} onChange={(e) => setStyle(e.target.value)} className={`${inputCls} w-full appearance-none`}>
-                    {STYLES.map((s) => <option key={s.id} value={s.id} className="bg-ink">{s.label}</option>)}
-                  </select>
-                </Field>
-                <Field label="YouTube privacy">
-                  <select value={privacy} onChange={(e) => setPrivacy(e.target.value)} className={`${inputCls} w-full appearance-none`}>
-                    <option value="private" className="bg-ink">Private</option>
-                    <option value="unlisted" className="bg-ink">Unlisted</option>
-                    <option value="public" className="bg-ink">Public</option>
-                  </select>
-                </Field>
+              <Ask>What are we forging — give me a topic, or let me roll one.</Ask>
+              <div className="ml-9.5 flex gap-2">
+                <input
+                  value={topic}
+                  onChange={(e) => setTopic(e.target.value)}
+                  maxLength={80}
+                  className={`${inputCls} flex-1`}
+                  placeholder="e.g. the Fermi paradox"
+                />
+                <button onClick={randomTopic} aria-label="Random" className="grid h-12 w-12 shrink-0 place-items-center rounded-xl border border-white/12 text-mute transition hover:border-lime/40 hover:text-lime">
+                  <Dices className="h-4.5 w-4.5" />
+                </button>
               </div>
 
-              <label className={`flex cursor-pointer items-center justify-between rounded-xl border px-4 py-3 transition ${yt.connected ? "border-white/12" : "border-white/[0.06] opacity-50"}`}>
-                <span className="text-sm font-semibold">Upload to YouTube when done</span>
-                <button
-                  type="button"
-                  disabled={!yt.connected}
-                  onClick={(e) => { e.preventDefault(); setAutoUpload((v) => !v); }}
-                  className={`relative h-6 w-11 rounded-full p-0.5 transition ${autoUpload && yt.connected ? "bg-lime" : "bg-white/10"}`}
-                >
-                  <span className={`block h-5 w-5 rounded-full bg-void transition-transform ${autoUpload && yt.connected ? "translate-x-5" : ""}`} />
-                </button>
-              </label>
+              <Ask>Which niche does it live in?</Ask>
+              <ChipRow
+                options={[...NICHES.map((n) => ({ id: n.id, label: n.label })), { id: "custom", label: "Custom / anything" }]}
+                value={niche}
+                onChange={setNiche}
+              />
 
+              <Ask>Pick a narrator to voice it.</Ask>
+              <ChipRow
+                options={VOICES.map((v) => ({ id: v.id, label: `${v.name} — ${v.vibe}` }))}
+                value={voice}
+                onChange={setVoice}
+              />
+
+              <Ask>And the visual style?</Ask>
+              <ChipRow options={STYLES.map((s) => ({ id: s.id, label: s.label }))} value={style} onChange={setStyle} />
+
+              <Ask>Once it's posted, who can see it on YouTube?</Ask>
+              <ChipRow
+                options={[
+                  { id: "private", label: "Private" },
+                  { id: "unlisted", label: "Unlisted" },
+                  { id: "public", label: "Public" },
+                ]}
+                value={privacy}
+                onChange={setPrivacy}
+              />
+
+              <Ask>
+                {yt.connected
+                  ? "Should I upload it to YouTube the moment it's done?"
+                  : "I'd upload it to YouTube automatically — but connect a channel first."}
+              </Ask>
+              <ChipRow
+                options={[
+                  { id: "yes", label: "Yes, auto-upload" },
+                  { id: "no", label: "Just render it" },
+                ]}
+                value={autoUpload && yt.connected ? "yes" : "no"}
+                onChange={(v) => yt.connected && setAutoUpload(v === "yes")}
+              />
+            </div>
+
+            <div className="mt-5 flex items-center gap-2.5 border-t border-white/[0.06] pt-5">
+              <p className="flex-1 truncate text-xs text-dim">
+                <span className="font-semibold text-cream">{topic || "…"}</span> · {format} · {niche} · {style}
+              </p>
               <button
                 onClick={forgeNow}
                 disabled={forging || !topic.trim()}
-                className="btn-sheen flex h-14 w-full items-center justify-center gap-2 rounded-2xl bg-lime text-sm font-bold text-void transition hover:brightness-110 disabled:opacity-50"
+                className="btn-sheen flex h-12 items-center gap-2 rounded-2xl bg-lime px-5 text-sm font-bold text-void transition hover:brightness-110 disabled:opacity-50"
               >
-                {forging ? <Loader2 className="h-4.5 w-4.5 animate-spin" /> : <Zap className="h-4.5 w-4.5 fill-current" />}
+                {forging ? <Loader2 className="h-4.5 w-4.5 animate-spin" /> : <Send className="h-4.5 w-4.5" />}
                 {forging ? "Queueing…" : `Forge & ${autoUpload && yt.connected ? "upload" : "render"}`}
               </button>
             </div>
