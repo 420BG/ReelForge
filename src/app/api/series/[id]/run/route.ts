@@ -4,6 +4,7 @@ import { eq } from "drizzle-orm";
 import { spawnForSeries } from "@/lib/scheduler";
 
 export const dynamic = "force-dynamic";
+export const maxDuration = 300;
 
 export async function POST(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;

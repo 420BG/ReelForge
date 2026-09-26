@@ -9,6 +9,7 @@ import { sceneImage } from "./images";
 import { renderVideo, STORAGE, ensureStorage } from "./render";
 import { uploadToYouTube } from "./upload";
 import { getAccount } from "@/lib/youtube";
+import { uploadToSupabase } from "@/lib/storage";
 import fs from "node:fs/promises";
 
 export type ProviderTrail = {
@@ -94,14 +95,26 @@ export async function runPipeline(videoId: string): Promise<void> {
       style: v.style as StyleId,
       scenes,
     });
+    const localVideoPath = path.join(STORAGE, out.videoRel);
+    const localThumbPath = path.join(STORAGE, out.thumbRel);
+
+    /* ── 4. persist to Supabase Storage ───────────────────── */
+    await setVideo(videoId, { status: "upload" });
+    const videoKey = await uploadToSupabase(localVideoPath, `${videoId}/video.mp4`, "video/mp4");
+    let thumbKey: string | null = null;
+    try {
+      thumbKey = await uploadToSupabase(localThumbPath, `${videoId}/thumb.jpg`, "image/jpeg");
+    } catch {
+      /* thumbnail is best-effort */
+    }
     await setVideo(videoId, {
-      videoRel: out.videoRel,
-      thumbRel: out.thumbRel,
+      videoRel: videoKey,
+      thumbRel: thumbKey,
       durationSec: out.durationSec,
       status: "rendered",
     });
 
-    /* ── 4. upload ─────────────────────────────────────────── */
+    /* ── 5. upload to YouTube ──────────────────────────────── */
     if (v.autoUpload === 1) {
       const acc = await getAccount();
       if (!acc) {
@@ -110,7 +123,7 @@ export async function runPipeline(videoId: string): Promise<void> {
       } else {
         await setVideo(videoId, { status: "upload" });
         const res = await uploadToYouTube({
-          filePath: path.join(STORAGE, out.videoRel),
+          filePath: localVideoPath,
           title: script.title,
           description: `${script.description}\n\n${script.tags.map((t) => `#${String(t).replace(/\s+/g, "")}`).join(" ")}`,
           tags: script.tags.map(String),
@@ -125,6 +138,11 @@ export async function runPipeline(videoId: string): Promise<void> {
         });
       }
     }
+
+    /* ── 6. clean up local scratch files ──────────────────── */
+    await fs.rm(path.join(STORAGE, "videos", videoId), { recursive: true, force: true }).catch(() => {});
+    await fs.rm(localVideoPath, { force: true }).catch(() => {});
+    await fs.rm(localThumbPath, { force: true }).catch(() => {});
   } catch (err) {
     console.error(`pipeline ${videoId} failed:`, err);
     await setVideo(videoId, {

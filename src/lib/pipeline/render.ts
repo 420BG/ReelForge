@@ -19,7 +19,12 @@ export interface RenderResult {
   durationSec: number;
 }
 
-export const STORAGE = path.join(process.cwd(), "storage");
+/* Vercel's filesystem is read-only except /tmp — use that in production
+   as scratch space; the final render gets uploaded to Supabase Storage
+   afterward, so nothing here needs to persist between invocations. */
+export const STORAGE = process.env.VERCEL
+  ? path.join("/tmp", "storage")
+  : path.join(process.cwd(), "storage");
 const FPS = 24;
 
 export async function ensureStorage() {

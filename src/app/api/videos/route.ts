@@ -1,3 +1,4 @@
+import { after } from "next/server";
 import { db } from "@/db";
 import { videos } from "@/db/schema";
 import { desc } from "drizzle-orm";
@@ -5,6 +6,7 @@ import { NICHES, VOICES, STYLES } from "@/lib/generator";
 import { runPipeline } from "@/lib/pipeline";
 
 export const dynamic = "force-dynamic";
+export const maxDuration = 300;
 
 export async function GET() {
   const rows = await db.select().from(videos).orderBy(desc(videos.createdAt)).limit(40);
@@ -46,6 +48,6 @@ export async function POST(req: Request) {
     })
     .returning({ id: videos.id });
 
-  runPipeline(v.id).catch((err) => console.error("pipeline crashed", err));
+  after(() => runPipeline(v.id).catch((err) => console.error("pipeline crashed", err)));
   return Response.json({ ok: true, videoId: v.id });
 }

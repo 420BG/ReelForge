@@ -1,3 +1,4 @@
+import { after } from "next/server";
 import { db } from "@/db";
 import { series, videos } from "@/db/schema";
 import { and, eq, lte } from "drizzle-orm";
@@ -38,7 +39,7 @@ export async function spawnForSeries(s: typeof series.$inferSelect): Promise<str
       status: "queued",
     })
     .returning({ id: videos.id });
-  runPipeline(v.id).catch((err) => console.error("pipeline crashed", err));
+  after(() => runPipeline(v.id).catch((err) => console.error("pipeline crashed", err)));
   return v.id;
 }
 
