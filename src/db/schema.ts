@@ -110,3 +110,14 @@ export const youtubeAccounts = pgTable("youtube_accounts", {
 });
 
 export type YouTubeAccountRow = typeof youtubeAccounts.$inferSelect;
+
+export const appSettings = pgTable("app_settings", {
+  id: integer("id").primaryKey().default(1),
+  dailyGoal: integer("daily_goal").notNull().default(3),
+  timezone: text("timezone").notNull().default("Asia/Kathmandu"),
+  updatedAt: timestamp("updated_at", { withTimezone: true })
+    .defaultNow()
+    .notNull(),
+});
+
+export type AppSettingsRow = typeof appSettings.$inferSelect;
