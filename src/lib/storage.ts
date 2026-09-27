@@ -54,3 +54,11 @@ export async function deleteFromSupabase(remoteKeys: (string | null | undefined)
     console.error("supabase delete failed", err);
   }
 }
+
+/** Download a stored object to a local path (used to hand a rendered video to the YouTube uploader). */
+export async function downloadToFile(remoteKey: string, localPath: string): Promise<void> {
+  const { data, error } = await client().storage.from(BUCKET).download(remoteKey);
+  if (error || !data) throw new Error(`supabase download failed (${remoteKey}): ${error?.message}`);
+  const buf = Buffer.from(await data.arrayBuffer());
+  await fs.writeFile(localPath, buf);
+}

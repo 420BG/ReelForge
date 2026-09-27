@@ -19,6 +19,7 @@ import {
   AlertTriangle,
   BookOpen,
   CircleCheck,
+  Upload,
 } from "lucide-react";
 import { YouTubeIcon } from "@/components/ui";
 import { isPending, timeAgo, type VideoItem, type ProviderItem, type YtStatus } from "./StudioApp";
@@ -36,10 +37,129 @@ const STATUS_META: Record<string, { label: string; cls: string }> = {
   failed: { label: "Failed", cls: "bg-red-500/15 text-red-400" },
 };
 
-function VideoCard({ v, onAction, onWatch }: { v: VideoItem; onAction: (id: string, a: "retry" | "delete") => void; onWatch: (v: VideoItem) => void }) {
+function PublishModal({
+  v,
+  onClose,
+  onDone,
+}: {
+  v: VideoItem;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const [title, setTitle] = useState(v.script?.title ?? v.title);
+  const [description, setDescription] = useState(v.script?.description ?? "");
+  const [tags, setTags] = useState((v.script?.tags ?? []).join(", "));
+  const [privacy, setPrivacy] = useState(v.privacy || "private");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const submit = async () => {
+    setBusy(true);
+    setErr(null);
+    try {
+      const res = await fetch(`/api/videos/${v.id}/publish`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title,
+          description,
+          tags: tags.split(",").map((t) => t.trim()).filter(Boolean),
+          privacy,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? "publish failed");
+      onDone();
+      onClose();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "publish failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const fieldCls =
+    "w-full rounded-xl border border-white/12 bg-white/[0.04] px-3.5 py-2.5 text-sm text-cream outline-none transition placeholder:text-dim focus:border-lime/50";
+
+  return (
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      className="fixed inset-0 z-[130] grid place-items-center bg-void/85 p-4 backdrop-blur-md"
+      onClick={onClose}
+    >
+      <motion.div
+        initial={{ scale: 0.94, y: 16 }}
+        animate={{ scale: 1, y: 0 }}
+        exit={{ scale: 0.96, y: 12 }}
+        className="glass-deep w-full max-w-md rounded-3xl p-6"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="mb-4 flex items-center justify-between">
+          <h3 className="flex items-center gap-2 font-display text-base font-bold">
+            <Upload className="h-4 w-4 text-lime" /> Publish to YouTube
+          </h3>
+          <button onClick={onClose} className="grid h-8 w-8 place-items-center rounded-full border border-white/10 text-mute hover:text-cream">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <div className="space-y-3">
+          <input value={title} onChange={(e) => setTitle(e.target.value)} maxLength={100} placeholder="Title" className={fieldCls} />
+          <textarea
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            rows={3}
+            placeholder="Description"
+            className={`${fieldCls} resize-none`}
+          />
+          <input value={tags} onChange={(e) => setTags(e.target.value)} placeholder="tags, comma, separated" className={fieldCls} />
+          <div className="flex gap-1.5">
+            {(["private", "unlisted", "public"] as const).map((p) => (
+              <button
+                key={p}
+                onClick={() => setPrivacy(p)}
+                className={`flex-1 rounded-xl border py-2 text-xs font-semibold capitalize transition ${
+                  privacy === p ? "border-lime/60 bg-lime/[0.08] text-cream" : "border-white/10 text-mute hover:text-cream"
+                }`}
+              >
+                {p}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {err && <p className="mt-3 text-xs text-red-400">{err}</p>}
+
+        <button
+          onClick={submit}
+          disabled={busy || !title.trim()}
+          className="btn-sheen mt-4 flex h-12 w-full items-center justify-center gap-2 rounded-2xl bg-lime text-sm font-bold text-void transition hover:brightness-110 disabled:opacity-50"
+        >
+          {busy ? <Loader2 className="h-4.5 w-4.5 animate-spin" /> : <Upload className="h-4.5 w-4.5" />}
+          {busy ? "Publishing…" : "Publish"}
+        </button>
+      </motion.div>
+    </motion.div>
+  );
+}
+
+function VideoCard({
+  v,
+  onAction,
+  onWatch,
+  onPublish,
+}: {
+  v: VideoItem;
+  onAction: (id: string, a: "retry" | "delete") => void;
+  onWatch: (v: VideoItem) => void;
+  onPublish: (v: VideoItem) => void;
+}) {
   const meta = STATUS_META[v.status] ?? STATUS_META.queued;
   const playing = isPending(v.status);
   const ready = v.status === "rendered" || v.status === "posted";
+  const canPublish = v.status === "rendered" && !v.youtubeId;
 
   return (
     <div className="glass group flex flex-col overflow-hidden rounded-2xl transition-colors hover:border-violet/40">
@@ -100,6 +220,14 @@ function VideoCard({ v, onAction, onWatch }: { v: VideoItem; onAction: (id: stri
               <YouTubeIcon className="h-3.5 w-3.5" /> Watch on YouTube
             </a>
           )}
+          {canPublish && (
+            <button
+              onClick={() => onPublish(v)}
+              className="flex items-center gap-1.5 rounded-lg bg-lime/15 px-2.5 py-1.5 text-[10px] font-bold text-lime transition hover:bg-lime/25"
+            >
+              <Upload className="h-3.5 w-3.5" /> Publish
+            </button>
+          )}
           <div className="flex-1" />
           {ready && (
             <a
@@ -125,27 +253,68 @@ function VideoCard({ v, onAction, onWatch }: { v: VideoItem; onAction: (id: stri
   );
 }
 
-export function VideoQueue({ videos, onAction }: { videos: VideoItem[]; onAction: (id: string, a: "retry" | "delete") => void }) {
+const FILTERS: { id: string; label: string; test: (s: string) => boolean }[] = [
+  { id: "all", label: "All", test: () => true },
+  { id: "queued", label: "Queued", test: (s) => s === "queued" },
+  { id: "rendering", label: "Rendering", test: (s) => ["script", "media", "render", "upload"].includes(s) },
+  { id: "ready", label: "Ready", test: (s) => s === "rendered" },
+  { id: "posted", label: "Published", test: (s) => s === "posted" },
+  { id: "failed", label: "Failed", test: (s) => s === "failed" },
+];
+
+export function VideoQueue({
+  videos,
+  onAction,
+  onChanged,
+}: {
+  videos: VideoItem[];
+  onAction: (id: string, a: "retry" | "delete") => void;
+  onChanged: () => void;
+}) {
   const [watching, setWatching] = useState<VideoItem | null>(null);
+  const [publishing, setPublishing] = useState<VideoItem | null>(null);
+  const [filter, setFilter] = useState("all");
+
+  const active = FILTERS.find((f) => f.id === filter) ?? FILTERS[0];
+  const shown = videos.filter((v) => active.test(v.status));
 
   return (
     <section className="mt-6">
-      <div className="mb-4 flex items-center justify-between">
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
         <h2 className="flex items-center gap-2 font-display text-lg font-bold">
           <Film className="h-4.5 w-4.5 text-lime" /> Video queue
         </h2>
         <span className="text-xs text-dim">{videos.length} forged</span>
       </div>
 
-      {videos.length === 0 ? (
+      <div className="mb-4 flex flex-wrap gap-1.5">
+        {FILTERS.map((f) => {
+          const count = videos.filter((v) => f.test(v.status)).length;
+          return (
+            <button
+              key={f.id}
+              onClick={() => setFilter(f.id)}
+              className={`rounded-full border px-3.5 py-1.5 text-xs font-semibold transition ${
+                filter === f.id ? "border-lime/60 bg-lime/[0.08] text-cream" : "border-white/10 bg-white/[0.02] text-mute hover:text-cream"
+              }`}
+            >
+              {f.label} {count > 0 && <span className="text-dim">· {count}</span>}
+            </button>
+          );
+        })}
+      </div>
+
+      {shown.length === 0 ? (
         <div className="glass rounded-2xl px-6 py-14 text-center">
           <Flame className="mx-auto h-6 w-6 text-dim" />
-          <p className="mt-3 text-sm text-mute">The queue is cold. Forge your first video above.</p>
+          <p className="mt-3 text-sm text-mute">
+            {videos.length === 0 ? "The queue is cold. Forge your first video above." : `Nothing in “${active.label}” yet.`}
+          </p>
         </div>
       ) : (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-          {videos.map((v) => (
-            <VideoCard key={v.id} v={v} onAction={onAction} onWatch={setWatching} />
+          {shown.map((v) => (
+            <VideoCard key={v.id} v={v} onAction={onAction} onWatch={setWatching} onPublish={setPublishing} />
           ))}
         </div>
       )}
@@ -180,13 +349,38 @@ export function VideoQueue({ videos, onAction }: { videos: VideoItem[]; onAction
                 loop
                 className={`w-full rounded-2xl border border-white/10 bg-black ${watching.format === "short" ? "aspect-[9/16]" : "aspect-video"}`}
               />
+              {watching.script?.description && (
+                <p className="mt-3 line-clamp-3 text-xs leading-relaxed text-mute">{watching.script.description}</p>
+              )}
               {Object.keys(watching.providers ?? {}).length > 0 && (
                 <p className="mt-2.5 text-center font-mono text-[10px] text-dim">
                   {Object.entries(watching.providers).map(([k, v]) => `${k}→${v}`).join("  ·  ")}
                 </p>
               )}
+              {watching.status === "rendered" && !watching.youtubeId && (
+                <button
+                  onClick={() => {
+                    setPublishing(watching);
+                    setWatching(null);
+                  }}
+                  className="btn-sheen mt-3 flex h-11 w-full items-center justify-center gap-2 rounded-2xl bg-lime text-sm font-bold text-void transition hover:brightness-110"
+                >
+                  <Upload className="h-4 w-4" /> Publish to YouTube
+                </button>
+              )}
             </motion.div>
           </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* publish modal */}
+      <AnimatePresence>
+        {publishing && (
+          <PublishModal
+            v={publishing}
+            onClose={() => setPublishing(null)}
+            onDone={onChanged}
+          />
         )}
       </AnimatePresence>
     </section>

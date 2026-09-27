@@ -55,6 +55,7 @@ export interface VideoItem {
   youtubeId: string | null;
   createdAt: string;
   postedAt: string | null;
+  script?: { title?: string; description?: string; tags?: string[] } | null;
 }
 
 export interface ProviderItem {
@@ -207,38 +208,29 @@ export default function StudioApp() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ topic, niche, voice, style, format, autoUpload: autoUpload && yt.connected, privacy }),
       });
-      if (!res.ok) {
-        const body = await res.json().catch(() => null);
-        throw new Error(body?.error || `request failed (${res.status})`);
-      }
+      if (!res.ok) throw new Error();
       say("Forging started — watch the queue.");
       setTimeout(loadVideos, 800);
-    } catch (err) {
-      say(err instanceof Error ? err.message : "Failed to queue the video.");
+    } catch {
+      say("Failed to queue the video.");
     } finally {
       setForging(false);
     }
   };
 
   const createSeries = async () => {
-    try {
-      const res = await fetch("/api/series", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name: sName, niche: sNiche, format: sFormat, frequency: sFreq,
-          autopilot: sAutopilot, autoUpload: sUpload && yt.connected, privacy, voice, style,
-        }),
-      });
-      if (!res.ok) {
-        const body = await res.json().catch(() => null);
-        throw new Error(body?.error || `request failed (${res.status})`);
-      }
+    const res = await fetch("/api/series", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: sName, niche: sNiche, format: sFormat, frequency: sFreq,
+        autopilot: sAutopilot, autoUpload: sUpload && yt.connected, privacy, voice, style,
+      }),
+    });
+    if (res.ok) {
       const d = await res.json();
       setSeries((s) => [d.series, ...s]);
       say(`Series "${sName}" armed.`);
-    } catch (err) {
-      say(err instanceof Error ? err.message : "Failed to create series.");
     }
   };
 
@@ -502,7 +494,7 @@ export default function StudioApp() {
           </section>
         </div>
 
-        <VideoQueue videos={videos} onAction={actionVideo} />
+        <VideoQueue videos={videos} onAction={actionVideo} onChanged={loadVideos} />
 
         <div className="mt-6 grid gap-6 lg:grid-cols-[1.4fr_1fr]">
           <ProvidersPanel providers={providers} />
