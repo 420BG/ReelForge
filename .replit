@@ -1,4 +1,3 @@
-modules = ["nodejs-20", "python-base-3.13"]
 [nix]
 channel = "stable-25_05"
-packages = ["unzip"]
+packages = ["unzip", "ffmpeg-full", "dejavu_fonts"]

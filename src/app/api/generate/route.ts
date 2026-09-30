@@ -1,52 +1,60 @@
 import { db } from "@/db";
-import { generations } from "@/db/schema";
-import {
-  generateShort,
-  NICHES,
-  VOICES,
-  STYLES,
-  type NicheId,
-  type VoiceId,
-  type StyleId,
-} from "@/lib/generator";
+import { projects } from "@/db/schema";
+import { isAuthenticated } from "@/lib/auth";
+import { serializeProject } from "@/lib/projects";
+import { categoryThumbnail, createAiStory, createOfflineStory, type StoryInput } from "@/lib/story";
+import { sceneDefaults } from "@/lib/timeline";
+import { CATEGORIES, CHARACTERS, type Character } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
-export async function POST(req: Request) {
-  let body: Record<string, unknown>;
+export async function POST(request: Request) {
+  if (!(await isAuthenticated())) return Response.json({ error: "Please unlock your studio first." }, { status: 401 });
   try {
-    body = await req.json();
-  } catch {
-    return Response.json({ error: "Invalid request body" }, { status: 400 });
+    const body = await request.json();
+    const idea = typeof body.idea === "string" ? body.idea.trim() : "";
+    if (idea.length < 5 || idea.length > 350) return Response.json({ error: "Write an idea between 5 and 350 characters." }, { status: 400 });
+    const input: StoryInput = {
+      idea,
+      category: CATEGORIES.includes(body.category) ? body.category : "Adventure",
+      ageGroup: ["2–4 years", "3–5 years", "5–7 years", "7–9 years"].includes(body.ageGroup) ? body.ageGroup : "3–5 years",
+      duration: [15, 20, 30, 45].includes(Number(body.duration)) ? Number(body.duration) : 30,
+      style: ["Storybook", "Claymation", "Colorful flat", "Dreamy pastel"].includes(body.style) ? body.style : "Storybook",
+      character: CHARACTERS.some((c) => c.value === body.character) ? body.character as Character : "fox",
+    };
+    let story;
+    let mode: "ai" | "offline" = "offline";
+    let note: string | null = null;
+    if (process.env.OPENROUTER_API_KEY) {
+      try {
+        story = await createAiStory(input);
+        mode = "ai";
+      } catch {
+        story = createOfflineStory(input);
+        note = "The free AI model was unavailable, so we used the built-in story maker instead. You can edit every scene.";
+      }
+    } else {
+      story = createOfflineStory(input);
+      note = "Made with the built-in story maker. Add an OpenRouter key in your server environment to use free AI models.";
+    }
+    const [row] = await db.insert(projects).values({
+      title: story.title,
+      idea: input.idea,
+      category: input.category,
+      ageGroup: input.ageGroup,
+      duration: input.duration,
+      style: input.style,
+      character: input.character,
+      scenes: story.scenes.map((scene, index) => ({ ...sceneDefaults(index), ...scene, duration: input.duration / story.scenes.length })),
+      status: "draft",
+      thumbnail: categoryThumbnail(input.category),
+      youtubeTitle: story.youtubeTitle,
+      description: story.description,
+      tags: story.tags,
+      privacy: "private",
+    }).returning();
+    return Response.json({ project: serializeProject(row), mode, note }, { status: 201 });
+  } catch (error) {
+    return Response.json({ error: error instanceof Error ? error.message : "Couldn't make a story right now." }, { status: 400 });
   }
-
-  const topic = String(body.topic ?? "").trim().replace(/\s+/g, " ").slice(0, 90);
-  if (!topic) {
-    return Response.json({ error: "Give the forge a topic first." }, { status: 400 });
-  }
-
-  const niche = NICHES.some((n) => n.id === body.niche) ? (body.niche as NicheId) : "custom";
-  const voice = VOICES.some((v) => v.id === body.voice) ? (body.voice as VoiceId) : "nova";
-  const style = STYLES.some((s) => s.id === body.style) ? (body.style as StyleId) : "cinematic";
-  const variant = Number.isInteger(body.variant) ? Math.max(0, Number(body.variant)) : 0;
-
-  const short = generateShort({ topic, niche, voice, style, variant });
-
-  try {
-    await db.insert(generations).values({
-      topic: short.topic,
-      niche: short.niche,
-      voice: short.voice,
-      style: short.style,
-      title: short.title,
-      score: short.score,
-      duration: Math.round(short.duration * 1000),
-      scenes: short.scenes,
-    });
-  } catch (err) {
-    // The draft still ships even if persistence hiccups — log and continue.
-    console.error("failed to persist generation", err);
-  }
-
-  return Response.json({ ok: true, short });
 }

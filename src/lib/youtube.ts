@@ -1,112 +1,72 @@
+import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import { db } from "@/db";
-import { youtubeAccounts, type YouTubeAccountRow } from "@/db/schema";
-import { eq } from "drizzle-orm";
+import { studioIntegrations } from "@/db/schema";
+import type { StudioConfig } from "@/lib/types";
 
-/* Hand-rolled YouTube Data API v3 OAuth + upload helpers (no SDK needed). */
-
-export function youtubeConfigured(): boolean {
+export function youtubeConfigured() {
   return Boolean(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET);
 }
 
-function appUrl(): string {
-  return (process.env.APP_URL ?? "http://localhost:3000").replace(/\/$/, "");
+export function redirectUri(requestUrl: string) {
+  return process.env.GOOGLE_REDIRECT_URI || new URL("/api/youtube/callback", requestUrl).toString();
 }
 
-export function authUrl(): string {
-  const params = new URLSearchParams({
-    client_id: process.env.GOOGLE_CLIENT_ID!,
-    redirect_uri: `${appUrl()}/api/youtube/callback`,
-    response_type: "code",
-    scope: [
-      "https://www.googleapis.com/auth/youtube.upload",
-      "https://www.googleapis.com/auth/youtube.readonly",
-    ].join(" "),
-    access_type: "offline",
-    prompt: "consent",
-  });
-  return `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
+function encryptionKey() {
+  const secret = process.env.APP_ENCRYPTION_KEY || process.env.GOOGLE_CLIENT_SECRET;
+  if (!secret) throw new Error("Google credentials are not configured.");
+  return createHash("sha256").update(secret).digest();
 }
 
-async function tokenRequest(body: Record<string, string>) {
-  const res = await fetch("https://oauth2.googleapis.com/token", {
+export function encryptToken(value: string) {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", encryptionKey(), iv);
+  const encrypted = Buffer.concat([cipher.update(value, "utf8"), cipher.final()]);
+  return [iv.toString("base64url"), cipher.getAuthTag().toString("base64url"), encrypted.toString("base64url")].join(".");
+}
+
+export function decryptToken(value: string) {
+  const [iv, tag, encrypted] = value.split(".");
+  const decipher = createDecipheriv("aes-256-gcm", encryptionKey(), Buffer.from(iv, "base64url"));
+  decipher.setAuthTag(Buffer.from(tag, "base64url"));
+  return Buffer.concat([decipher.update(Buffer.from(encrypted, "base64url")), decipher.final()]).toString("utf8");
+}
+
+export async function getIntegration() {
+  const [row] = await db.select().from(studioIntegrations).limit(1);
+  return row ?? null;
+}
+
+export async function getStudioConfig(): Promise<StudioConfig> {
+  const integration = await getIntegration();
+  return {
+    openRouterConfigured: Boolean(process.env.OPENROUTER_API_KEY),
+    pollinationsConfigured: Boolean(process.env.POLLINATIONS_API_KEY),
+    elevenLabsConfigured: Boolean(process.env.ELEVENLABS_API_KEY),
+    pexelsConfigured: Boolean(process.env.PEXELS_API_KEY),
+    pixabayConfigured: Boolean(process.env.PIXABAY_API_KEY),
+    youtubeConfigured: youtubeConfigured(),
+    youtubeConnected: Boolean(integration?.youtubeRefreshToken),
+    youtubeChannelTitle: integration?.youtubeChannelTitle ?? null,
+    youtubeChannelAvatar: integration?.youtubeChannelAvatar ?? null,
+  };
+}
+
+export async function getYouTubeAccessToken() {
+  const integration = await getIntegration();
+  if (!integration?.youtubeRefreshToken || !youtubeConfigured()) throw new Error("Connect your YouTube channel in Settings first.");
+  const refreshToken = decryptToken(integration.youtubeRefreshToken);
+  const response = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams(body),
-    signal: AbortSignal.timeout(20_000),
+    body: new URLSearchParams({
+      client_id: process.env.GOOGLE_CLIENT_ID!,
+      client_secret: process.env.GOOGLE_CLIENT_SECRET!,
+      refresh_token: refreshToken,
+      grant_type: "refresh_token",
+    }),
+    cache: "no-store",
   });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error_description ?? data.error ?? "token exchange failed");
-  return data as { access_token: string; refresh_token?: string; expires_in: number };
-}
-
-export async function exchangeCode(code: string): Promise<void> {
-  const tokens = await tokenRequest({
-    client_id: process.env.GOOGLE_CLIENT_ID!,
-    client_secret: process.env.GOOGLE_CLIENT_SECRET!,
-    code,
-    grant_type: "authorization_code",
-    redirect_uri: `${appUrl()}/api/youtube/callback`,
-  });
-
-  let channelTitle: string | null = null;
-  let channelId: string | null = null;
-  try {
-    const res = await fetch("https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true", {
-      headers: { Authorization: `Bearer ${tokens.access_token}` },
-      signal: AbortSignal.timeout(20_000),
-    });
-    const data = await res.json();
-    channelTitle = data.items?.[0]?.snippet?.title ?? null;
-    channelId = data.items?.[0]?.id ?? null;
-  } catch {
-    /* channel lookup is cosmetic — tokens matter */
-  }
-
-  const existing = await db.select().from(youtubeAccounts).limit(1);
-  const values = {
-    channelTitle,
-    channelId,
-    accessToken: tokens.access_token,
-    refreshToken: tokens.refresh_token ?? existing[0]?.refreshToken ?? null,
-    expiryDate: String(Date.now() + tokens.expires_in * 1000),
-    updatedAt: new Date(),
-  };
-  if (existing[0]) {
-    await db
-      .update(youtubeAccounts)
-      .set(values)
-      .where(eq(youtubeAccounts.id, existing[0].id));
-  } else {
-    await db.insert(youtubeAccounts).values(values);
-  }
-}
-
-export async function getAccount(): Promise<YouTubeAccountRow | null> {
-  const rows = await db.select().from(youtubeAccounts).limit(1);
-  return rows[0] ?? null;
-}
-
-export async function disconnectYouTube(): Promise<void> {
-  await db.delete(youtubeAccounts);
-}
-
-export async function freshAccessToken(acc: YouTubeAccountRow): Promise<string> {
-  const expiry = Number(acc.expiryDate ?? 0);
-  if (acc.accessToken && Date.now() < expiry - 60_000) return acc.accessToken;
-  if (!acc.refreshToken) throw new Error("no refresh token stored — reconnect YouTube");
-  const tokens = await tokenRequest({
-    client_id: process.env.GOOGLE_CLIENT_ID!,
-    client_secret: process.env.GOOGLE_CLIENT_SECRET!,
-    refresh_token: acc.refreshToken,
-    grant_type: "refresh_token",
-  });
-  await db
-    .update(youtubeAccounts)
-    .set({
-      accessToken: tokens.access_token,
-      expiryDate: String(Date.now() + tokens.expires_in * 1000),
-      updatedAt: new Date(),
-    })
-    .where(eq(youtubeAccounts.id, acc.id));
-  return tokens.access_token;
+  const data = await response.json();
+  if (!response.ok || !data.access_token) throw new Error("Your YouTube connection expired. Reconnect it in Settings.");
+  return data.access_token as string;
 }

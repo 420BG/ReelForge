@@ -1,55 +1,97 @@
-/* Session signing that works in both the edge middleware and Node runtime. */
+import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
+import { cookies } from "next/headers";
+import { and, eq, gt } from "drizzle-orm";
+import { db } from "@/db";
+import { ensureStudioSchema } from "@/db/bootstrap";
+import { studioOwner, studioSessions } from "@/db/schema";
 
-export const SESSION_COOKIE = "rf_session";
-const MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000; // 14 days
+const COOKIE_NAME = "littleloop_session";
+const SESSION_DAYS = 30;
 
-export function appPassword(): string {
-  return process.env.APP_PASSWORD ?? "reelforge";
+export function hashPin(pin: string) {
+  const salt = randomBytes(24).toString("hex");
+  const hash = scryptSync(pin, salt, 64).toString("hex");
+  return `${salt}:${hash}`;
 }
 
-/* Key is only enforced when APP_PASSWORD is explicitly set in the env.
-   Without it, the gate is a single "Unlock" tap. */
-export function authRequired(): boolean {
-  return Boolean(process.env.APP_PASSWORD);
-}
-
-function hex(buffer: ArrayBuffer): string {
-  return Array.from(new Uint8Array(buffer))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-}
-
-async function hmac(data: string): Promise<string> {
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(appPassword()),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(data));
-  return hex(sig);
-}
-
-export async function createSessionValue(): Promise<string> {
-  const ts = Date.now().toString();
-  const sig = await hmac(ts);
-  return `${ts}.${sig}`;
-}
-
-export async function verifySessionValue(value: string | undefined): Promise<boolean> {
+export function verifyPin(pin: string, stored: string) {
   try {
-    if (!value) return false;
-    const dot = value.lastIndexOf(".");
-    if (dot <= 0) return false;
-    const ts = value.slice(0, dot);
-    const sig = value.slice(dot + 1);
-    const tsNum = Number(ts);
-    if (!Number.isFinite(tsNum) || Date.now() - tsNum > MAX_AGE_MS) return false;
-    const expected = await hmac(ts);
-    return expected === sig;
+    const [salt, expectedHex] = stored.split(":");
+    const expected = Buffer.from(expectedHex, "hex");
+    const actual = scryptSync(pin, salt, expected.length);
+    return expected.length === actual.length && timingSafeEqual(actual, expected);
   } catch {
-    // never let a crypto quirk 500 the whole app
     return false;
   }
+}
+
+function tokenHash(token: string) {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+export async function getOwner() {
+  await ensureStudioSchema();
+  const { hydrateSecrets } = await import("@/lib/keys");
+  await hydrateSecrets();
+  const [owner] = await db.select().from(studioOwner).limit(1);
+  return owner ?? null;
+}
+
+export async function getAuthState(): Promise<"setup" | "locked" | "authenticated"> {
+  const owner = await getOwner();
+  if (!owner) return "setup";
+  const token = (await cookies()).get(COOKIE_NAME)?.value;
+  if (!token) return "locked";
+  const [session] = await db.select().from(studioSessions).where(and(eq(studioSessions.tokenHash, tokenHash(token)), gt(studioSessions.expiresAt, new Date()))).limit(1);
+  return session ? "authenticated" : "locked";
+}
+
+export async function isAuthenticated() {
+  return (await getAuthState()) === "authenticated";
+}
+
+export async function createSession() {
+  const token = randomBytes(32).toString("base64url");
+  const expiresAt = new Date(Date.now() + SESSION_DAYS * 24 * 60 * 60 * 1000);
+  await db.insert(studioSessions).values({ tokenHash: tokenHash(token), expiresAt });
+  (await cookies()).set(COOKIE_NAME, token, {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: process.env.NODE_ENV === "production",
+    path: "/",
+    expires: expiresAt,
+  });
+}
+
+export async function clearSession() {
+  const cookieStore = await cookies();
+  const token = cookieStore.get(COOKIE_NAME)?.value;
+  if (token) await db.delete(studioSessions).where(eq(studioSessions.tokenHash, tokenHash(token)));
+  cookieStore.delete(COOKIE_NAME);
+}
+
+export async function registerOwner(pin: string) {
+  if (pin.length < 6 || pin.length > 64) throw new Error("Use a PIN or passphrase with at least 6 characters.");
+  const existing = await getOwner();
+  if (existing) throw new Error("This studio already has an owner.");
+  await db.insert(studioOwner).values({ id: 1, pinHash: hashPin(pin) });
+  await createSession();
+}
+
+export async function signInOwner(pin: string) {
+  const owner = await getOwner();
+  if (!owner) throw new Error("Set up your studio first.");
+  if (owner.lockedUntil && owner.lockedUntil > new Date()) {
+    throw new Error("Too many attempts. Please try again in 15 minutes.");
+  }
+  if (!verifyPin(pin, owner.pinHash)) {
+    const attempts = owner.failedAttempts + 1;
+    await db.update(studioOwner).set({
+      failedAttempts: attempts >= 5 ? 0 : attempts,
+      lockedUntil: attempts >= 5 ? new Date(Date.now() + 15 * 60 * 1000) : null,
+    }).where(eq(studioOwner.id, owner.id));
+    throw new Error(attempts >= 5 ? "Too many attempts. Please try again in 15 minutes." : "That PIN doesn't look right. Please try again.");
+  }
+  await db.update(studioOwner).set({ failedAttempts: 0, lockedUntil: null }).where(eq(studioOwner.id, owner.id));
+  await createSession();
 }
