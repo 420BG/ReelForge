@@ -5,6 +5,7 @@ import { Power, Play, Trash2, Timer, Calendar, Pencil, Check, X, Clock3 } from "
 import { NICHES } from "@/lib/generator";
 import { timeUntil, timeAgo } from "@/components/studio/StudioApp";
 import { useStudio } from "@/components/studio/StudioContext";
+import AgentBatch from "@/components/agent/AgentBatch";
 
 const inputCls =
   "h-12 rounded-xl border border-white/12 bg-white/[0.04] px-4 text-sm text-cream outline-none transition placeholder:text-dim focus:border-lime/50";
@@ -91,6 +92,8 @@ export default function AutopilotPage() {
           {autopilotActive ? "Active" : "Paused"}
         </button>
       </div>
+
+      <AgentBatch />
 
       <div className="mb-6 grid gap-4 sm:grid-cols-2">
         <section className="glass-deep rounded-3xl p-5">

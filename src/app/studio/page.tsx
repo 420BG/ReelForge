@@ -1,11 +1,11 @@
-import StudioApp from "@/components/studio/StudioApp";
+import Home from "@/components/agent/Home";
 
 export const dynamic = "force-dynamic";
 
 export const metadata = {
-  title: "Autopilot Studio — ReelForge",
+  title: "Studio — ReelForge",
 };
 
 export default function StudioPage() {
-  return <StudioApp />;
+  return <Home />;
 }
