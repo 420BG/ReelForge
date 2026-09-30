@@ -1,4 +1,7 @@
 import { writeFile } from "node:fs/promises";
+import type { VoiceId } from "@/lib/generator";
+import { narrate } from "@/lib/pipeline/tts";
+import { cloudflareConfigured } from "@/content/story-engine/llm";
 import type { NicheDefinition } from "@/content/niches/registry";
 import type { VideoSettings, VoiceStyle } from "@/content/types";
 import { probe, runFfmpeg } from "@/video/composition/ffmpeg";
@@ -28,16 +31,28 @@ const ELEVEN_SETTINGS: Record<VoiceStyle, { stability: number; similarity_boost:
   warm: { stability: 0.5, similarity_boost: 0.8, style: 0.3 },
 };
 
-export type VoicePlan = { provider: "pollinations" | "elevenlabs"; voiceId: string; style: VoiceStyle; gender: "female" | "male"; pace: number };
+/** ReelForge's free, key-less narrators (StreamElements Polly relay → Google TTS fallback). */
+const FREE_VOICES: Record<VoiceStyle, { female: VoiceId; male: VoiceId }> = {
+  horror: { female: "lyra", male: "atlas" },
+  storytelling: { female: "lyra", male: "atlas" },
+  calm: { female: "sage", male: "orion" },
+  excited: { female: "nova", male: "orion" },
+  documentary: { female: "sage", male: "atlas" },
+  warm: { female: "lyra", male: "orion" },
+};
+const FREE_IDS = ["nova", "atlas", "orion", "lyra", "sage"];
 
-export function voiceProviderAvailable(settings: VideoSettings): "pollinations" | "elevenlabs" | null {
+export type VoicePlan = { provider: "free" | "pollinations" | "elevenlabs"; voiceId: string; style: VoiceStyle; gender: "female" | "male"; pace: number };
+
+export function voiceProviderAvailable(settings: VideoSettings): "free" | "pollinations" | "elevenlabs" | null {
   if (settings.voiceProvider === "none") return null;
+  if (settings.voiceProvider === "free") return "free";
   if (settings.voiceProvider === "elevenlabs") return process.env.ELEVENLABS_API_KEY ? "elevenlabs" : null;
   if (settings.voiceProvider === "pollinations") return process.env.POLLINATIONS_API_KEY ? "pollinations" : null;
   if (process.env.ELEVENLABS_API_KEY && settings.voiceId && !/^[a-z]{2}_[a-z]+$/.test(settings.voiceId)) return "elevenlabs";
   if (process.env.POLLINATIONS_API_KEY) return "pollinations";
   if (process.env.ELEVENLABS_API_KEY) return "elevenlabs";
-  return null;
+  return "free";
 }
 
 let elevenCache: { at: number; voices: { id: string; gender: string }[] } | null = null;
@@ -61,6 +76,10 @@ export async function planVoice(settings: VideoSettings, niche: NicheDefinition)
   if (!provider) return null;
   const gender = settings.voiceGender === "auto" ? niche.voice.gender : settings.voiceGender;
   const style = niche.voice.style;
+  if (provider === "free") {
+    const voiceId = settings.voiceId && FREE_IDS.includes(settings.voiceId) ? settings.voiceId : FREE_VOICES[style][gender];
+    return { provider, voiceId, style, gender, pace: niche.voice.pace };
+  }
   if (provider === "pollinations") {
     const voiceId = settings.voiceId && /^[a-z]{2}_[a-z]+$/.test(settings.voiceId) ? settings.voiceId : KOKORO[style][gender];
     return { provider, voiceId, style, gender, pace: niche.voice.pace };
@@ -69,7 +88,15 @@ export async function planVoice(settings: VideoSettings, niche: NicheDefinition)
   return { provider, voiceId, style, gender, pace: niche.voice.pace };
 }
 
-async function fetchVoice(plan: VoicePlan, text: string, voiceId: string): Promise<Buffer> {
+async function fetchVoice(plan: VoicePlan, text: string, voiceId: string, workFile: string): Promise<Buffer> {
+  if (plan.provider === "free") {
+    const { readFile } = await import("node:fs/promises");
+    const result = await narrate(text, voiceId as VoiceId, workFile).catch(() => ({ provider: null }));
+    if (result.provider) return readFile(workFile);
+    // Backup free voice: Cloudflare Workers AI MeloTTS (only if CLOUDFLARE_* keys are set).
+    if (cloudflareConfigured()) return cloudflareTts(text);
+    throw new ProviderError("Free narration relays are unavailable right now.", true);
+  }
   let response: Response;
   try {
     if (plan.provider === "elevenlabs") {
@@ -94,17 +121,44 @@ async function fetchVoice(plan: VoicePlan, text: string, voiceId: string): Promi
   return bytes;
 }
 
+/** Cloudflare Workers AI MeloTTS — free daily allowance, single English voice. Returns MP3 bytes. */
+async function cloudflareTts(text: string): Promise<Buffer> {
+  let response: Response;
+  try {
+    response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${process.env.CLOUDFLARE_ACCOUNT_ID}/ai/run/@cf/myshell-ai/melotts`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: text.slice(0, 600), lang: "en" }),
+      signal: AbortSignal.timeout(60_000), cache: "no-store",
+    });
+  } catch (error) {
+    throw new ProviderError(`Cloudflare TTS unreachable (${error instanceof Error ? error.message : "network"}).`, true);
+  }
+  if (!response.ok) throw new ProviderError(`Cloudflare TTS returned ${response.status}.`, httpRetryable(response.status), response.status);
+  const type = response.headers.get("content-type") || "";
+  let bytes: Buffer;
+  if (type.startsWith("audio/")) bytes = Buffer.from(await response.arrayBuffer());
+  else {
+    const data = await response.json().catch(() => null) as { result?: { audio?: string }; audio?: string } | null;
+    const b64 = data?.result?.audio ?? data?.audio;
+    if (!b64) throw new ProviderError("Cloudflare TTS returned no audio.", true);
+    bytes = Buffer.from(b64, "base64");
+  }
+  if (bytes.length < 800) throw new ProviderError("Cloudflare TTS returned an empty clip.", true);
+  return bytes;
+}
+
 /** Generates one scene's narration, applies pacing for the niche, and returns the real duration. */
 export async function synthesizeNarration(plan: VoicePlan, text: string, outFile: string, workFile: string): Promise<{ duration: number; voiceId: string }> {
   let voiceId = plan.voiceId;
   let bytes: Buffer;
   try {
-    bytes = await fetchVoice(plan, text, voiceId);
+    bytes = await fetchVoice(plan, text, voiceId, workFile);
   } catch (error) {
     // Unknown Kokoro voice ids come back as 4xx — fall back to the voice the app already uses.
     if (plan.provider === "pollinations" && error instanceof ProviderError && !error.retryable && voiceId !== KOKORO_FALLBACK) {
       voiceId = KOKORO_FALLBACK;
-      bytes = await fetchVoice(plan, text, voiceId);
+      bytes = await fetchVoice(plan, text, voiceId, workFile);
     } else throw error;
   }
   await writeFile(workFile, bytes);

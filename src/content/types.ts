@@ -5,7 +5,8 @@
 
 export type Audience = "general" | "kids";
 export type Workflow = "draft" | "processing" | "review" | "approved" | "published" | "failed";
-export type RenderMode = "video" | "image" | "mixed";
+/** "stock" = free real stock footage (Pexels/Pixabay), NOT AI-generated video. */
+export type RenderMode = "video" | "image" | "stock" | "mixed";
 
 export type SceneBeat = "hook" | "setup" | "escalation" | "twist" | "payoff" | "ending" | "loop";
 export type CameraMove =
@@ -105,7 +106,7 @@ export type VideoSettings = {
   targetDuration: number;
   style: VisualStyle;
   voiceGender: "female" | "male" | "auto";
-  voiceProvider: "auto" | "pollinations" | "elevenlabs" | "none";
+  voiceProvider: "auto" | "free" | "pollinations" | "elevenlabs" | "none";
   voiceId?: string;
   quality: "draft" | "production";
   provider: "auto" | "pollinations" | "fal" | "replicate";
@@ -161,6 +162,8 @@ export type AgentConfig = {
   /** Master switch. Per-video autoPublish is ignored while this is false. */
   autoPublishEnabled: boolean;
   allowImageMode: boolean;
+  /** Free STOCK VIDEO fallback (Pexels/Pixabay) when no AI video provider works. On by default; always labelled. */
+  allowStockVideo: boolean;
   defaultProvider: VideoSettings["provider"];
   models: {
     pollinations: { video: string; image: string };
@@ -180,6 +183,7 @@ export const DEFAULT_AGENT_CONFIG: AgentConfig = {
   dailyClipLimit: 40,
   autoPublishEnabled: false,
   allowImageMode: false,
+  allowStockVideo: true,
   defaultProvider: "auto",
   models: {
     pollinations: { video: "", image: "flux" },
@@ -196,7 +200,7 @@ export type SceneAsset = {
   sceneIndex: number;
   kind: "clip" | "voice" | "keyframe" | "segment";
   status: SceneAssetStatus;
-  mode: "video" | "image" | "audio" | null;
+  mode: "video" | "image" | "stock" | "audio" | null;
   provider: string | null;
   attempts: number;
   error: string | null;

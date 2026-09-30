@@ -1,6 +1,6 @@
 import { hookGuidance, scoreHook, STRATEGY_RULES } from "@/content/hooks";
 import { getNiche, type NicheDefinition } from "@/content/niches/registry";
-import { completeJson, textModelConfigured } from "@/content/story-engine/llm";
+import { completeJson, textModelAvailable, textModelConfigured } from "@/content/story-engine/llm";
 import { normalizePlan, sceneCountFor, WORDS_PER_SECOND } from "@/content/story-engine/normalize";
 import { createTemplatePlan } from "@/content/story-engine/template";
 import type { StoryPlan, VisualStyle } from "@/content/types";
@@ -62,7 +62,7 @@ export async function generateStoryPlan(request: StoryRequest): Promise<{ plan: 
   const niche = getNiche(request.niche);
   const subNiche = request.subNiche && niche.subNiches.some((item) => item.id === request.subNiche) ? request.subNiche : niche.subNiches[0]?.id ?? "";
   const sceneCount = sceneCountFor(request.targetDuration, request.maxScenes);
-  if (textModelConfigured()) {
+  if (textModelConfigured() || (niche.fiction !== "never" && textModelAvailable())) {
     try {
       const { system, user } = buildPrompt(niche, { ...request, subNiche }, sceneCount);
       const { json, model } = await completeJson(system, user);
@@ -74,7 +74,7 @@ export async function generateStoryPlan(request: StoryRequest): Promise<{ plan: 
     }
   }
   const plan = normalizePlan(createTemplatePlan(niche, subNiche, request.idea ?? ""), niche, subNiche, request.targetDuration, request.maxScenes, request.timezone, "template");
-  return { plan, note: "No story model key configured (OPENROUTER_API_KEY or POLLINATIONS_API_KEY); used the built-in template writer." };
+  return { plan, note: "No story model key configured (GROQ_API_KEY, GEMINI_API_KEY or OPENROUTER_API_KEY); used the built-in template writer." };
 }
 
 export type IdeaCandidate = { niche: string; subNiche: string; idea: string; hook: string; score: number };
@@ -83,7 +83,7 @@ export type IdeaCandidate = { niche: string; subNiche: string; idea: string; hoo
 export async function generateIdeas(nicheId: string, count: number, avoidTitles: string[]): Promise<IdeaCandidate[]> {
   const niche = getNiche(nicheId);
   const want = Math.max(1, Math.min(20, count));
-  if (textModelConfigured()) {
+  if (textModelConfigured() || (niche.fiction !== "never" && textModelAvailable())) {
     try {
       const { json } = await completeJson(
         `You are a YouTube Shorts content strategist for the niche "${niche.label}" (${niche.tone}). ${niche.storyRules} Ideas must be ORIGINAL, not retellings of existing creators' stories. ${niche.fiction === "never" ? "Only well-documented, accurate topics." : "Fiction only."}`,
@@ -102,6 +102,6 @@ Return ONLY JSON: {"ideas":[{"subNiche":"one of ${niche.subNiches.map((item) => 
       if (unique.length) return unique.sort((a, b) => b.score - a.score).slice(0, want);
     } catch { /* fall through to template seeds */ }
   }
-  if (niche.fiction === "never") throw new Error(`${niche.label} needs a story model key for idea generation (facts can't come from templates).`);
+  if (niche.fiction === "never") throw new Error(`${niche.label} needs a story model key (Groq, Gemini or OpenRouter) for idea generation (facts can't come from templates).`);
   return Array.from({ length: want }, (_, index) => ({ niche: niche.id, subNiche: niche.subNiches[index % Math.max(1, niche.subNiches.length)]?.id ?? "", idea: "", hook: "", score: 0 }));
 }

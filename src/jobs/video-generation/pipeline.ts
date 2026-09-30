@@ -8,12 +8,13 @@ import {
   extendLease, getAssets, getConfig, getVideoRow, logJob, normalizeVideoSettings, recentTitles, recordUsage, updateVideo, upsertAsset, usageToday, type AssetRow,
 } from "@/jobs/repo";
 import { publishAgentVideo } from "@/jobs/youtube-upload";
-import { getIntegration } from "@/lib/youtube";
+import { getAccount } from "@/lib/youtube";
 import { composeFinal, planTimeline, renderSceneSegment, type ComposeScene } from "@/video/composition/compose";
 import { ffmpegAvailable, probe } from "@/video/composition/ffmpeg";
 import { validateFinal } from "@/video/composition/validate";
 import { estimateCost, resolveProvider } from "@/video/providers";
-import { pollinationsImage } from "@/video/providers/pollinations";
+import { generateImage } from "@/video/providers/images";
+import { stockClipFor, stockConfigured } from "@/video/providers/stock";
 import { ProviderError, type VideoProvider } from "@/video/providers/types";
 import { ensureScratch, fileExists, materialize, putFile, storageKey, storedLooksPresent } from "@/video/storage";
 import { scenePrompt } from "@/video/storyboard";
@@ -97,11 +98,12 @@ async function failAsset(ctx: Ctx, index: number, kind: "clip" | "keyframe", att
 async function clipsStep(ctx: Ctx): Promise<StepOutcome> {
   const story = ctx.story!;
   const provider = resolveProvider(ctx.settings, ctx.config);
-  const imageMode = !provider && ctx.settings.allowImageMode && ctx.config.allowImageMode && Boolean(process.env.POLLINATIONS_API_KEY);
-  if (!provider && !imageMode) {
-    return { state: "failed", step: "clips", error: "Video provider not configured." + (ctx.settings.allowImageMode && !ctx.config.allowImageMode ? " (IMAGE MODE is also disabled in Agent settings.)" : "") };
+  const imageMode = !provider && ctx.settings.allowImageMode && ctx.config.allowImageMode;
+  const stockMode = !provider && ctx.config.allowStockVideo && stockConfigured();
+  if (!provider && !imageMode && !stockMode) {
+    return { state: "failed", step: "clips", error: "Video provider not configured. Turn on free STOCK VIDEO or IMAGE MODE in Settings." + (ctx.settings.allowImageMode && !ctx.config.allowImageMode ? " (IMAGE MODE is disabled in Agent settings.)" : "") };
   }
-  await updateVideo(ctx.videoId, { provider: provider ? provider.id : "pollinations-image" });
+  await updateVideo(ctx.videoId, { provider: provider ? provider.id : stockMode ? "stock" : "free-image" });
   const clips = new Map((await getAssets(ctx.videoId, "clip")).map((asset) => [asset.scene_index, asset]));
   const keyframes = new Map((await getAssets(ctx.videoId, "keyframe")).map((asset) => [asset.scene_index, asset]));
   const total = story.scenes.length;
@@ -142,18 +144,44 @@ async function clipsStep(ctx: Ctx): Promise<StepOutcome> {
       return { state: "waiting", step: "clips", delaySeconds: 3600, currentScene: i, error: "Paused: daily clip limit reached.", progress: progressFor("clips", doneCount / total) };
     }
 
+    // STOCK VIDEO (explicit opt-in): real free footage from Pexels/Pixabay, labelled as stock — not AI video.
+    // If nothing matches a scene, that scene falls back to IMAGE MODE when it's allowed.
+    if (stockMode && asset?.mode !== "image") {
+      try {
+        await upsertAsset(ctx.videoId, i, "clip", { status: "running", mode: "stock", provider: "stock", attempts, error: null, next_attempt_at: null });
+        const avoid = new Set([...clips.values()].map((clip) => String(clip.meta?.stockId ?? "")).filter(Boolean));
+        const stock = await stockClipFor(scene, story, { seed: prompts.seed + i, avoid });
+        const file = path.join(await ensureScratch(ctx.videoId), `clip-${i}.mp4`);
+        await writeFile(file, stock.bytes);
+        const info = await probe(file).catch(() => null);
+        if (!info?.hasVideo || info.duration < 0.5) throw new ProviderError("Stock file is not a playable video.", true);
+        const key = storageKey.clip(ctx.videoId, i, "mp4");
+        await putFile(key, file);
+        await recordUsage(`${stock.source}-video`, info.duration, 0);
+        await upsertAsset(ctx.videoId, i, "clip", { status: "done", mode: "stock", provider: stock.source, path: key, error: null, attempts, meta: { duration: info.duration, width: info.width, height: info.height, stockId: stock.stockId, credit: stock.credit, pageUrl: stock.pageUrl, query: stock.query } });
+        await logJob(ctx.job.id, "info", `Scene ${i + 1}: STOCK VIDEO “${stock.query}” from ${stock.source === "pexels" ? "Pexels" : "Pixabay"} (by ${stock.credit}) — real footage, not AI video.`);
+        return { state: "queued", step: "clips", currentScene: i, progress: progressFor("clips", (doneCount + 1) / total) };
+      } catch (error) {
+        const retryable = error instanceof ProviderError ? error.retryable : true;
+        if (!imageMode || retryable) return failAsset(ctx, i, "clip", attempts, error);
+        await logJob(ctx.job.id, "warn", `Scene ${i + 1}: ${error instanceof Error ? error.message : String(error)} Using IMAGE MODE for this scene.`);
+        await upsertAsset(ctx.videoId, i, "clip", { status: "failed", mode: "image", attempts: 0, error: null, next_attempt_at: null });
+        return { state: "queued", step: "clips", currentScene: i, progress: progressFor("clips", doneCount / total) };
+      }
+    }
+
     // IMAGE MODE (explicit opt-in only): a still per scene, animated later with camera motion.
     if (imageMode) {
       try {
-        await upsertAsset(ctx.videoId, i, "clip", { status: "running", mode: "image", provider: "pollinations-image", attempts });
-        const image = await pollinationsImage(prompts.keyframePrompt, prompts.seed + i, ctx.config);
+        await upsertAsset(ctx.videoId, i, "clip", { status: "running", mode: "image", provider: "free-image", attempts });
+        const image = await generateImage(prompts.keyframePrompt, prompts.seed + i, ctx.config);
         const key = storageKey.clip(ctx.videoId, i, "jpg");
         const file = path.join(await ensureScratch(ctx.videoId), `clip-${i}.jpg`);
         await writeFile(file, image.bytes);
         await putFile(key, file);
-        await recordUsage("pollinations-image", 0, null);
-        await upsertAsset(ctx.videoId, i, "clip", { status: "done", mode: "image", provider: "pollinations-image", path: key, error: null, attempts });
-        await logJob(ctx.job.id, "info", `Scene ${i + 1}: IMAGE MODE still generated (not AI video).`);
+        await recordUsage(image.provider, 0, null);
+        await upsertAsset(ctx.videoId, i, "clip", { status: "done", mode: "image", provider: image.provider, path: key, error: null, attempts });
+        await logJob(ctx.job.id, "info", `Scene ${i + 1}: IMAGE MODE still from ${image.provider} (not AI video).`);
         return { state: "queued", step: "clips", currentScene: i, progress: progressFor("clips", (doneCount + 1) / total) };
       } catch (error) { return failAsset(ctx, i, "clip", attempts, error); }
     }
@@ -161,7 +189,7 @@ async function clipsStep(ctx: Ctx): Promise<StepOutcome> {
     const videoProvider = provider!;
     // Character consistency: keyframe from a fixed character seed, then image-to-video (where supported).
     let imageDataUrl: string | undefined;
-    const wantsKeyframe = ctx.settings.consistency && videoProvider.capabilities.imageToVideo && Boolean(process.env.POLLINATIONS_API_KEY) && scene.characters.length > 0;
+    const wantsKeyframe = ctx.settings.consistency && videoProvider.capabilities.imageToVideo && scene.characters.length > 0;
     if (wantsKeyframe) {
       const keyframe = keyframes.get(i);
       if (keyframe?.status === "done" && keyframe.path && (await storedLooksPresent(keyframe.path))) {
@@ -169,12 +197,12 @@ async function clipsStep(ctx: Ctx): Promise<StepOutcome> {
       } else if (!keyframe || keyframe.status !== "failed" || keyframe.attempts < ctx.config.maxAttemptsPerScene) {
         const kfAttempts = (keyframe?.attempts ?? 0) + 1;
         try {
-          const image = await pollinationsImage(prompts.keyframePrompt, prompts.seed, ctx.config);
+          const image = await generateImage(prompts.keyframePrompt, prompts.seed, ctx.config);
           const key = storageKey.keyframe(ctx.videoId, i);
           const file = path.join(await ensureScratch(ctx.videoId), `keyframe-${i}.jpg`);
           await writeFile(file, image.bytes);
           await putFile(key, file);
-          await upsertAsset(ctx.videoId, i, "keyframe", { status: "done", mode: "image", provider: "pollinations-image", path: key, attempts: kfAttempts, error: null });
+          await upsertAsset(ctx.videoId, i, "keyframe", { status: "done", mode: "image", provider: image.provider, path: key, attempts: kfAttempts, error: null });
           await logJob(ctx.job.id, "info", `Scene ${i + 1}: character keyframe ready (seed ${prompts.seed}).`);
           return { state: "queued", step: "clips", currentScene: i, progress: progressFor("clips", doneCount / total) };
         } catch (error) {
@@ -317,16 +345,17 @@ async function composeStep(ctx: Ctx): Promise<StepOutcome> {
   await putFile(storageKey.final(ctx.videoId), outFile);
   const hasCover = await fileExists(coverFile);
   if (hasCover) await putFile(storageKey.cover(ctx.videoId), coverFile);
-  const modes = new Set(scenes.map((scene) => scene.kind));
-  const renderMode = modes.size > 1 ? "mixed" : modes.has("image") ? "image" : "video";
-  const prior = (Array.isArray(ctx.row.warnings) ? (ctx.row.warnings as string[]) : []).filter((w) => !/^Narration sped up|No synthesized sound|Final length|Cover image failed|IMAGE MODE|Duration .* above|No narration/.test(w));
+  const modes = new Set(plan.scenes.map((scene) => (plan.clips.get(scene.index)?.mode === "stock" ? "stock" : scene.kind)));
+  const renderMode = modes.size > 1 ? "mixed" : modes.has("image") ? "image" : modes.has("stock") ? "stock" : "video";
+  const stockCredits = Array.from(new Set([...plan.clips.values()].filter((clip) => clip.mode === "stock").map((clip) => `${clip.meta?.credit ?? "unknown"} (${clip.provider === "pixabay" ? "Pixabay" : "Pexels"})`)));
+  const prior = (Array.isArray(ctx.row.warnings) ? (ctx.row.warnings as string[]) : []).filter((w) => !/^Narration sped up|No synthesized sound|Final length|Cover image failed|IMAGE MODE|STOCK VIDEO|Duration .* above|No narration/.test(w));
   const costs = [...plan.clips.values()].map((clip) => Number(clip.meta?.cost)).filter((n) => Number.isFinite(n));
   await updateVideo(ctx.videoId, {
     final_path: storageKey.final(ctx.videoId),
     cover_path: hasCover ? storageKey.cover(ctx.videoId) : null,
     duration_sec: Math.round(result.duration * 10) / 10,
     render_mode: renderMode,
-    warnings: Array.from(new Set([...prior, ...result.warnings, ...report.warnings, ...(renderMode !== "video" ? ["IMAGE MODE: some or all scenes are still images with camera motion, not AI video."] : [])])).slice(0, 20),
+    warnings: Array.from(new Set([...prior, ...result.warnings, ...report.warnings, ...(modes.has("image") ? ["IMAGE MODE: some or all scenes are still images with camera motion, not AI video."] : []), ...(modes.has("stock") ? [`STOCK VIDEO: some or all scenes are free stock footage, not AI video. Credits: ${stockCredits.join(", ")}.`] : [])])).slice(0, 20),
     cost_estimate: costs.length ? Math.round(costs.reduce((sum, n) => sum + n, 0) * 100) / 100 : null,
   });
   await logJob(ctx.job.id, "info", `Validated: ${report.width}×${report.height}, ${report.duration.toFixed(1)}s, ${(report.sizeBytes / 1e6).toFixed(1)} MB.`);
@@ -336,7 +365,7 @@ async function composeStep(ctx: Ctx): Promise<StepOutcome> {
 /** Moves the finished video to REVIEW (or on to publish when auto-publish is explicitly on). */
 async function validateStep(ctx: Ctx): Promise<StepOutcome> {
   if (!ctx.row.final_path) return { state: "queued", step: "segments" };
-  const autopublish = ctx.config.autoPublishEnabled && ctx.settings.autoPublish && Boolean((await getIntegration())?.youtubeRefreshToken);
+  const autopublish = ctx.config.autoPublishEnabled && ctx.settings.autoPublish && Boolean((await getAccount())?.refreshToken);
   await updateVideo(ctx.videoId, { workflow: autopublish ? "approved" : "review", error: null });
   await logJob(ctx.job.id, "info", autopublish ? "Auto-publish is on." : "Waiting for your review.");
   return autopublish ? { state: "queued", step: "publish", progress: progressFor("validate", 1) } : { state: "done", step: "done", progress: 100, currentScene: null };

@@ -38,6 +38,8 @@ export function normalizeConfig(input: unknown): AgentConfig {
     dailyClipLimit: clampInt(value.dailyClipLimit, 1, 500, DEFAULT_AGENT_CONFIG.dailyClipLimit),
     autoPublishEnabled: value.autoPublishEnabled === true,
     allowImageMode: value.allowImageMode === true,
+    // On unless you switched it off: free, labelled stock footage beats a failed render.
+    allowStockVideo: value.allowStockVideo !== false,
     defaultProvider: ["auto", "pollinations", "fal", "replicate"].includes(String(value.defaultProvider)) ? (value.defaultProvider as AgentConfig["defaultProvider"]) : "auto",
     models: {
       pollinations: { video: text(models.pollinations?.video, ""), image: text(models.pollinations?.image, "flux") || "flux" },
@@ -70,7 +72,7 @@ export function normalizeVideoSettings(input: unknown, base: VideoSettings = DEF
     targetDuration: clampInt(value.targetDuration ?? base.targetDuration, 10, 60, 30),
     style: pick(value.style ?? base.style, ["cinematic", "dark-cinematic", "animation-3d", "anime", "realistic", "storybook"] as const, "cinematic"),
     voiceGender: pick(value.voiceGender ?? base.voiceGender, ["female", "male", "auto"] as const, "auto"),
-    voiceProvider: pick(value.voiceProvider ?? base.voiceProvider, ["auto", "pollinations", "elevenlabs", "none"] as const, "auto"),
+    voiceProvider: pick(value.voiceProvider ?? base.voiceProvider, ["auto", "free", "pollinations", "elevenlabs", "none"] as const, "auto"),
     voiceId: typeof (value.voiceId ?? base.voiceId) === "string" && /^[a-zA-Z0-9_-]{2,80}$/.test(String(value.voiceId ?? base.voiceId)) ? String(value.voiceId ?? base.voiceId) : undefined,
     quality: pick(value.quality ?? base.quality, ["draft", "production"] as const, "production"),
     provider: pick(value.provider ?? base.provider, ["auto", "pollinations", "fal", "replicate"] as const, "auto"),
@@ -218,6 +220,20 @@ export async function workflowCounts() {
   const counts: Record<string, number> = { draft: 0, processing: 0, review: 0, approved: 0, published: 0, failed: 0 };
   for (const row of rows) counts[row.workflow] = Number(row.count);
   return { ...counts, total: Object.values(counts).reduce((sum, n) => sum + n, 0) };
+}
+
+/** Videos created today / this week (owner timezone) and videos currently in the queue. */
+export async function activityCounts(timezone: string) {
+  const tz = /^[A-Za-z_]+\/[A-Za-z_/-]+$|^UTC$/.test(timezone) ? timezone : "UTC";
+  const [row] = await q<{ today: string; week: string; queue: string }>(
+    `SELECT
+       count(*) FILTER (WHERE (created_at AT TIME ZONE $1)::date = (now() AT TIME ZONE $1)::date)::text AS today,
+       count(*) FILTER (WHERE created_at >= now() - interval '7 days')::text AS week,
+       (SELECT count(*) FROM agent_jobs WHERE state IN ('queued','running','waiting'))::text AS queue
+     FROM agent_videos`,
+    [tz],
+  );
+  return { today: Number(row?.today ?? 0), week: Number(row?.week ?? 0), queue: Number(row?.queue ?? 0) };
 }
 
 /* ---------------- jobs ---------------- */
