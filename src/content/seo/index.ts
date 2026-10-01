@@ -23,14 +23,14 @@ export function suggestPublishTime(niche: NicheDefinition, seed: number, timezon
   return `${String(hour).padStart(2, "0")}:00 (${timezone}), ${days}`;
 }
 
-export function normalizeSeo(raw: unknown, niche: NicheDefinition, plan: Pick<StoryPlan, "title" | "concept" | "isFiction" | "hook">, timezone: string): SeoPack {
+export function normalizeSeo(raw: unknown, niche: NicheDefinition, plan: Pick<StoryPlan, "title" | "concept" | "isFiction" | "hook"> & { format?: StoryPlan["format"] }, timezone: string): SeoPack {
   const value = typeof raw === "object" && raw !== null ? (raw as Record<string, unknown>) : {};
   const title = honestTitle(clean(value.title, 95) || plan.title, plan.isFiction);
   const hashtags = Array.from(new Set([
     ...(Array.isArray(value.hashtags) ? value.hashtags : []).map((item) => hashtag(String(item))),
     ...niche.seo.hashtags,
-    "#shorts",
-  ].filter(Boolean))).slice(0, 8);
+    plan.format === "long" ? "" : "#shorts",
+  ].filter(Boolean))).filter((tag) => plan.format !== "long" || tag.toLowerCase() !== "#shorts").slice(0, 8);
   const tags = Array.from(new Set([
     ...(Array.isArray(value.tags) ? value.tags : []).map((item) => clean(item, 40).toLowerCase()),
     ...niche.seo.baseTags,
@@ -54,9 +54,9 @@ export type AgentUploadMetadata = {
 };
 
 /** Builds YouTube metadata for an agent video. Made-for-kids follows the per-video audience. */
-export function agentUploadMetadata(seo: SeoPack, audience: Audience, privacy: "private" | "unlisted" | "public", aiDisclosure: string): AgentUploadMetadata {
+export function agentUploadMetadata(seo: SeoPack, audience: Audience, privacy: "private" | "unlisted" | "public", aiDisclosure: string, format: "short" | "long" = "short"): AgentUploadMetadata {
   const base = seo.title.replace(/#shorts/gi, "").trim().slice(0, 88);
-  const title = `${base} #Shorts`.slice(0, 100);
+  const title = format === "long" ? base.slice(0, 100) : `${base} #Shorts`.slice(0, 100);
   const description = [seo.description, aiDisclosure, seo.hashtags.join(" ")].filter(Boolean).join("\n\n").slice(0, 4900);
   return {
     snippet: { title, description, tags: seo.tags.slice(0, 15), categoryId: seo.categoryId || "24" },

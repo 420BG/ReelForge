@@ -26,7 +26,7 @@ export async function startAutopilotBatch(request: AutopilotRequest) {
   if (!pool.length) throw new Error("Unknown niche.");
   if (!hasModel) {
     pool = pool.filter((niche) => niche.fiction !== "never");
-    if (!pool.length) throw new Error("Factual niches need a story model key (GROQ_API_KEY, GEMINI_API_KEY or OPENROUTER_API_KEY) so facts aren't invented.");
+    if (!pool.length) throw new Error("Factual niches need a story model key (e.g. GROQ_API_KEY, GEMINI_API_KEY, CEREBRAS_API_KEY or MISTRAL_API_KEY) so facts aren't invented.");
   }
   const batchId = await createBatch({ ...request, count, createdAt: new Date().toISOString() });
   const avoid = await recentTitles(30);

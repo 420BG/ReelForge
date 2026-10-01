@@ -14,7 +14,8 @@ const OWNER = `${hostname()}-${process.pid}-${randomBytes(3).toString("hex")}`;
 const SERVERLESS = Boolean(process.env.VERCEL);
 /** Lease must outlive one unit of work: Vercel functions stop at ~300 s. */
 const LEASE_SECONDS = SERVERLESS ? 330 : 900;
-const MAX_TICKS = 800;
+/** Long videos take a few hundred small steps (+ polling while providers work). */
+const MAX_TICKS = 3000;
 const MAX_JOB_ERRORS = 4;
 
 const globalRunner = globalThis as typeof globalThis & { __agentTickBusy?: boolean; __agentWorker?: ReturnType<typeof setInterval> };

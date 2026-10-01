@@ -1,4 +1,5 @@
 import { getNiche, isKnownNiche } from "@/content/niches/registry";
+import { continueInBackground } from "@/jobs/worker";
 import { generateStoryPlan } from "@/content/story-engine";
 import { fail, guard } from "@/jobs/api-helpers";
 import { createVideo, enqueueJob, getConfig, getVideo, listVideos, normalizeVideoSettings, recentTitles } from "@/jobs/repo";
@@ -32,7 +33,8 @@ export async function POST(request: Request) {
     const config = await getConfig();
     const settings = normalizeVideoSettings({ ...(body.settings ?? {}), audience: niche.audience, allowImageMode: Boolean(body.settings?.allowImageMode) && config.allowImageMode });
     const subNiche = typeof body.subNiche === "string" && niche.subNiches.some((item) => item.id === body.subNiche) ? body.subNiche : null;
-    if (body.mode === "plan") {
+    // Long videos are outlined and written part by part inside the pipeline (resumable), so they always queue.
+    if (body.mode === "plan" && settings.format !== "long" && !settings.script) {
       const { plan, note } = await generateStoryPlan({
         niche: niche.id, subNiche: subNiche ?? undefined, idea: settings.idea, targetDuration: settings.targetDuration, style: settings.style,
         maxScenes: config.maxScenesPerVideo, timezone: config.timezone, voiceGender: settings.voiceGender, avoidTitles: await recentTitles(20),
@@ -42,6 +44,7 @@ export async function POST(request: Request) {
     }
     const video = await createVideo({ niche: niche.id, subNiche, settings, audience: niche.audience });
     await enqueueJob(video.id, "story", "Queued from Create.");
+    continueInBackground(new URL(request.url).origin);
     return Response.json({ video: await getVideo(video.id), note: null }, { status: 201 });
   } catch (error) {
     return fail(error);

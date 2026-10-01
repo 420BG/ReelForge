@@ -131,7 +131,8 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   }, []);
 
   useEffect(() => {
-    const id = setInterval(loadVideos, 6000);
+    // Every poll costs a database connection — go easy, and pause while the tab is hidden.
+    const id = setInterval(() => { if (!document.hidden) loadVideos(); }, 15000);
     return () => clearInterval(id);
   }, [loadVideos]);
 

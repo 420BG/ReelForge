@@ -57,11 +57,17 @@ export async function publishAgentVideo(videoId: string, opts: { requireApproved
   const bytes = await readStored(String(row.final_path)).catch(() => null);
   if (!bytes) throw new Error("The rendered MP4 is missing from storage. Re-render it first.");
   const renderMode = String(row.render_mode ?? "video");
+  const warnings = Array.isArray(row.warnings) ? (row.warnings as string[]) : [];
+  const stockNote = warnings.find((w) => w.startsWith("STOCK VIDEO"))?.match(/Credits: (.*)\.$/)?.[1];
   const disclosure = renderMode === "image"
-    ? "Visuals: AI-generated still images animated with camera motion. Narration: AI voice."
-    : "Made with AI-generated video, AI voice narration and synthesized music.";
+    ? "Visuals: AI-generated images for every scene, animated with camera motion. Script, narration and music: AI / synthesized."
+    : renderMode === "stock"
+      ? `Visuals: free stock footage${stockNote ? ` by ${stockNote}` : " (Pexels/Pixabay)"}. Script and narration: AI.`
+      : renderMode === "mixed"
+        ? `Visuals: AI-generated images with camera motion and AI image-to-video clips${stockNote ? `, plus stock footage by ${stockNote}` : ""}. Narration: AI voice.`
+        : "Made with AI-generated video, AI voice narration and synthesized music.";
   const privacy = (["private", "unlisted", "public"].includes(String(row.privacy)) ? row.privacy : "private") as "private" | "unlisted" | "public";
-  const metadata = agentUploadMetadata(story.seo, row.audience === "kids" ? "kids" : "general", privacy, disclosure);
+  const metadata = agentUploadMetadata(story.seo, row.audience === "kids" ? "kids" : "general", privacy, disclosure, story.format === "long" ? "long" : "short");
   let youtubeId: string;
   try {
     youtubeId = await resumableUpload(bytes, { ...metadata, status: { ...metadata.status, containsSyntheticMedia: true } });

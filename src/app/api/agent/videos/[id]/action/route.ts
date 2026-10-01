@@ -1,4 +1,5 @@
 import { fail, guard, UUID } from "@/jobs/api-helpers";
+import { continueInBackground } from "@/jobs/worker";
 import {
   activeJobFor, cancelJobs, enqueueJob, getVideo, getVideoRow, resetAssets, resetFailedAssets, updateVideo,
 } from "@/jobs/repo";
@@ -35,6 +36,7 @@ export async function POST(request: Request, context: Context) {
       if (await activeJobFor(id)) throw new Error("A job for this video is already running.");
       await updateVideo(id, { workflow: "processing", error: null });
       await enqueueJob(id, step, note);
+      continueInBackground(new URL(request.url).origin);
     };
 
     switch (action) {
@@ -57,7 +59,7 @@ export async function POST(request: Request, context: Context) {
       }
       case "rewrite-story":
         if (await activeJobFor(id)) throw new Error("A job for this video is already running.");
-        if (story) await resetAssets(id, story.scenes.map((scene) => scene.index), ["clip", "keyframe", "voice"]);
+        if (story) await resetAssets(id, story.scenes.map((scene) => scene.index), ["clip", "keyframe", "voice", "story", "part"]);
         await updateVideo(id, { story: null, title: "", hook: null, final_path: null, cover_path: null, render_mode: null });
         await start("story", "Rewriting story from scratch.");
         break;

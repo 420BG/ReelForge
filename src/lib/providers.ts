@@ -19,7 +19,7 @@ export const PROVIDERS: ProviderMeta[] = [
   {
     id: "groq",
     kind: "script",
-    name: "Groq (Llama 3.3 70B)",
+    name: "Groq (GPT-OSS, auto-updating model)",
     freeLimit: "~1,000 req/day",
     resets: "Midnight UTC",
     getKeyUrl: "https://console.groq.com/keys",
@@ -29,7 +29,7 @@ export const PROVIDERS: ProviderMeta[] = [
   {
     id: "gemini",
     kind: "script",
-    name: "Google Gemini 2.0 Flash",
+    name: "Google Gemini Flash (latest)",
     freeLimit: "~1,500 req/day",
     resets: "Midnight Pacific",
     getKeyUrl: "https://aistudio.google.com/apikey",

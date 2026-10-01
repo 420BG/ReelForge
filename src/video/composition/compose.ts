@@ -13,6 +13,11 @@ import { captionFonts, probe, runFfmpeg } from "@/video/composition/ffmpeg";
  */
 
 export const OUTPUT = { width: 1080, height: 1920, fps: 30 } as const;
+export type Dims = { width: number; height: number; fps: number };
+/** Shorts are 1080×1920 (9:16); long videos are 1920×1080 (16:9). */
+export function dimsFor(format: "short" | "long" | undefined): Dims {
+  return format === "long" ? { width: 1920, height: 1080, fps: 30 } : { ...OUTPUT };
+}
 
 export type ComposeScene = {
   index: number;
@@ -46,6 +51,10 @@ export type ComposeInput = {
   outFile: string;
   coverFile: string;
   onProgress?: (label: string) => Promise<void> | void;
+  /** Output size (default 1080×1920). */
+  dims?: Dims;
+  /** Long videos render in parts: music + loudness are applied once over the joined parts instead. */
+  partMode?: boolean;
 };
 
 export type TimelineEntry = { index: number; start: number; length: number; transitionOut: number; voiceStart: number; voiceDuration: number };
@@ -69,28 +78,32 @@ export function buildTimeline(scenes: Pick<ComposeScene, "voiceDuration" | "plan
   return { entries, total: lastEntry ? lastEntry.start + lastEntry.length : 0 };
 }
 
-function overlayChain(fx: AtmosphereFx[], seconds: number, inputLabel: string, outLabel: string, extraInputIndex: number) {
+function overlayChain(fx: AtmosphereFx[], seconds: number, inputLabel: string, outLabel: string, extraInputIndex: number, dims: Dims = OUTPUT) {
   // IMAGE MODE only: procedural weather layers so stills are not static.
   const kind = fx.includes("rain") ? "rain" : fx.includes("snow") ? "snow" : fx.includes("fog") || fx.includes("smoke") ? "fog" : fx.includes("dust") || fx.includes("particles") ? "dust" : null;
   if (!kind) return { filter: `[${inputLabel}]null[${outLabel}]`, input: null as string[] | null };
-  const size = kind === "fog" ? "24x44" : "540x960";
-  const input = ["-f", "lavfi", "-i", `color=c=0x808080:s=${size}:r=${OUTPUT.fps}:d=${seconds.toFixed(2)}`];
+  const landscape = dims.width > dims.height;
+  const size = kind === "fog" ? (landscape ? "44x24" : "24x44") : landscape ? "960x540" : "540x960";
+  const full = `${dims.width}:${dims.height}`;
+  const input = ["-f", "lavfi", "-i", `color=c=0x808080:s=${size}:r=${dims.fps}:d=${seconds.toFixed(2)}`];
   const src = `[${extraInputIndex}:v]`;
   let layer: string;
   let opacity: number;
-  if (kind === "rain") { layer = `${src}noise=alls=100:allf=t,lutyuv=y='if(gt(val,247),255,16)':u=128:v=128,avgblur=sizeX=1:sizeY=12,lutyuv=y='clip((val-16)*9,0,255)',scale=1080:1920`; opacity = 0.3; }
-  else if (kind === "snow") { layer = `${src}noise=alls=100:allf=t,lutyuv=y='if(gt(val,250),255,16)':u=128:v=128,gblur=sigma=1.5,lutyuv=y='clip((val-16)*5,0,255)',scale=1080:1920`; opacity = 0.45; }
-  else if (kind === "dust") { layer = `${src}noise=alls=100:allf=t,lutyuv=y='if(gt(val,252),230,16)':u=128:v=128,gblur=sigma=1.2,lutyuv=y='clip((val-16)*4,0,255)',scale=1080:1920`; opacity = 0.4; }
-  else { layer = `${src}noise=alls=100:allf=0,scale=1080:1920:flags=bicubic,gblur=sigma=30,lutyuv=y='clip((val-80)*1.3,0,255)':u=128:v=128,scroll=horizontal=0.0015`; opacity = 0.25; }
+  if (kind === "rain") { layer = `${src}noise=alls=100:allf=t,lutyuv=y='if(gt(val,247),255,16)':u=128:v=128,avgblur=sizeX=1:sizeY=12,lutyuv=y='clip((val-16)*9,0,255)',scale=${full}`; opacity = 0.3; }
+  else if (kind === "snow") { layer = `${src}noise=alls=100:allf=t,lutyuv=y='if(gt(val,250),255,16)':u=128:v=128,gblur=sigma=1.5,lutyuv=y='clip((val-16)*5,0,255)',scale=${full}`; opacity = 0.45; }
+  else if (kind === "dust") { layer = `${src}noise=alls=100:allf=t,lutyuv=y='if(gt(val,252),230,16)':u=128:v=128,gblur=sigma=1.2,lutyuv=y='clip((val-16)*4,0,255)',scale=${full}`; opacity = 0.4; }
+  else { layer = `${src}noise=alls=100:allf=0,scale=${full}:flags=bicubic,gblur=sigma=30,lutyuv=y='clip((val-80)*1.3,0,255)':u=128:v=128,scroll=horizontal=0.0015`; opacity = 0.25; }
   return {
     filter: `${layer},format=yuv420p[fx${outLabel}];[${inputLabel}]format=yuv420p[base${outLabel}];[base${outLabel}][fx${outLabel}]blend=c0_mode=screen:c0_opacity=${opacity}:c1_opacity=0:c2_opacity=0[${outLabel}]`,
     input,
   };
 }
 
-async function renderSegment(scene: ComposeScene, length: number, grade: string, out: string) {
+async function renderSegment(scene: ComposeScene, length: number, grade: string, out: string, OUTPUT: Dims) {
   const post = [grade, atmospherePostFilter(scene.atmosphere)].filter((item) => item && item !== "null").join(",");
   const frames = Math.round(length * OUTPUT.fps);
+  const bigW = Math.round(OUTPUT.width * 1.5);
+  const bigH = Math.round(OUTPUT.height * 1.5);
   const args: string[] = [];
   let graph: string;
   if (scene.kind === "video") {
@@ -102,9 +115,9 @@ async function renderSegment(scene: ComposeScene, length: number, grade: string,
   } else {
     args.push("-loop", "1", "-framerate", String(OUTPUT.fps), "-t", length.toFixed(3), "-i", scene.source);
     const motion = `${zoompanFor(scene.camera, frames)}:d=1:s=${OUTPUT.width}x${OUTPUT.height}:fps=${OUTPUT.fps}`;
-    const overlay = overlayChain(scene.atmosphere, length, "moved", "wx", 1);
+    const overlay = overlayChain(scene.atmosphere, length, "moved", "wx", 1, OUTPUT);
     if (overlay.input) args.push(...overlay.input);
-    graph = `[0:v]scale=1620:2880:force_original_aspect_ratio=increase,crop=1620:2880,${motion},setsar=1[moved];${overlay.filter};[wx]${post || "null"},format=yuv420p[v]`;
+    graph = `[0:v]scale=${bigW}:${bigH}:force_original_aspect_ratio=increase,crop=${bigW}:${bigH},${motion},setsar=1[moved];${overlay.filter};[wx]${post || "null"},format=yuv420p[v]`;
   }
   args.push("-filter_complex", graph, "-map", "[v]", "-t", length.toFixed(3), "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-maxrate", "10M", "-bufsize", "20M", "-pix_fmt", "yuv420p", "-r", String(OUTPUT.fps), out);
   await runFfmpeg(args, 270_000);
@@ -140,9 +153,9 @@ export function planTimeline(scenes: Pick<ComposeScene, "voiceDuration" | "plann
   return { ...plan, voiceFactor, warnings };
 }
 
-/** Renders ONE scene segment (1080×1920, no audio). Safe to run in its own serverless request. */
-export async function renderSceneSegment(scene: ComposeScene, length: number, grade: NicheDefinition["colorGrade"], out: string) {
-  await renderSegment(scene, length, gradeFilter(grade), out);
+/** Renders ONE scene segment (no audio). Safe to run in its own serverless request. */
+export async function renderSceneSegment(scene: ComposeScene, length: number, grade: NicheDefinition["colorGrade"], out: string, dims: Dims = OUTPUT) {
+  await renderSegment(scene, length, gradeFilter(grade), out, dims);
 }
 
 export type FinalInput = ComposeInput & { segments: string[] };
@@ -150,6 +163,8 @@ export type FinalInput = ComposeInput & { segments: string[] };
 /** Final pass: transitions + captions + voice/music/SFX mix + encode + cover, from pre-rendered segments. */
 export async function composeFinal(input: FinalInput): Promise<ComposeResult> {
   const { workDir } = input;
+  const OUTPUT = input.dims ?? dimsFor("short");
+  const partMode = Boolean(input.partMode);
   if (!input.scenes.length || input.segments.length !== input.scenes.length) throw new Error("Segments are missing for some scenes.");
   const planned = planTimeline(input.scenes, input.maxDuration);
   const warnings = [...planned.warnings];
@@ -175,12 +190,12 @@ export async function composeFinal(input: FinalInput): Promise<ComposeResult> {
     duration: scene.voiceFile ? entries[i].voiceDuration : Math.max(1, entries[i].length - entries[i].transitionOut - 0.3),
   }));
   const hookUntil = Math.min(2.8, entries[0].length - 0.1);
-  await writeFile(path.join(workDir, "captions.ass"), input.captionsEnabled ? buildAss(cues, input.captions, family, { text: input.hookText, until: hookUntil }) : buildAss([], { ...input.captions, hookTitle: false }, family));
+  await writeFile(path.join(workDir, "captions.ass"), input.captionsEnabled ? buildAss(cues, input.captions, family, { text: input.hookText, until: hookUntil }, OUTPUT) : buildAss([], { ...input.captions, hookTitle: false }, family, undefined, OUTPUT));
 
   // 3) Audio stems
   const audioInputs: { file: string; delay: number; role: "voice" | "music" | "sfx"; volume: number }[] = [];
   scenes.forEach((scene, i) => { if (scene.voiceFile) audioInputs.push({ file: scene.voiceFile, delay: entries[i].voiceStart, role: "voice", volume: 1 }); });
-  if (input.musicMood && input.musicVolume > 0) {
+  if (!partMode && input.musicMood && input.musicVolume > 0) {
     const licensed = await licensedMusic(input.musicMood);
     const musicFile = licensed ?? path.join(workDir, "music.wav");
     if (!licensed) await renderMusic(input.musicMood, total, musicFile);
@@ -249,7 +264,7 @@ export async function composeFinal(input: FinalInput): Promise<ComposeResult> {
     graph.push(`${sfx.map((_, k) => `[s${k}]`).join("")}amix=inputs=${sfx.length}:normalize=0:duration=longest[fx]`);
     mixParts.push("[fx]");
   }
-  if (mixParts.length) graph.push(`${mixParts.join("")}amix=inputs=${mixParts.length}:normalize=0:duration=longest,atrim=0:${total.toFixed(3)},afade=t=out:st=${Math.max(0, total - 0.6).toFixed(3)}:d=0.6,loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[aout]`);
+  if (mixParts.length) graph.push(`${mixParts.join("")}amix=inputs=${mixParts.length}:normalize=0:duration=longest,apad,atrim=0:${total.toFixed(3)}${partMode ? "" : `,afade=t=out:st=${Math.max(0, total - 0.6).toFixed(3)}:d=0.6,loudnorm=I=-14:TP=-1.5:LRA=11`},aresample=48000[aout]`);
   else graph.push(`anullsrc=r=48000:cl=stereo,atrim=0:${total.toFixed(3)}[aout]`);
 
   const fast = input.quality === "draft" || Boolean(process.env.VERCEL);
@@ -264,8 +279,9 @@ export async function composeFinal(input: FinalInput): Promise<ComposeResult> {
   await runFfmpeg(args.map((arg) => (arg.startsWith(workDir) ? path.relative(workDir, arg) : arg)), 280_000, workDir);
 
   // 5) Cover image: first scene frame + title
+  if (!input.coverFile) return { duration: total, warnings, timeline: entries };
   try {
-    const coverAss = buildAss([], { ...input.captions, hookTitle: true, size: 104 }, family, { text: input.coverTitle, until: 5 }).replace(",250,1\n", ",720,1\n");
+    const coverAss = buildAss([], { ...input.captions, hookTitle: true, size: 104 }, family, { text: input.coverTitle, until: 5 }, OUTPUT).replace(/,(250|90),1\n/, `,${Math.round(OUTPUT.height * 0.375)},1\n`);
     await writeFile(path.join(workDir, "cover.ass"), coverAss);
     await runFfmpeg(["-i", path.relative(workDir, segments[0]), "-ss", Math.min(1.2, entries[0].length / 2).toFixed(2), "-frames:v", "1", "-vf", "ass=cover.ass:fontsdir=fonts", "-q:v", "3", path.resolve(input.coverFile)], 60_000, workDir);
   } catch (error) {
@@ -282,8 +298,39 @@ export async function compose(input: ComposeInput): Promise<ComposeResult> {
   for (const [i, scene] of input.scenes.entries()) {
     await input.onProgress?.(`Rendering scene ${i + 1}/${input.scenes.length}`);
     const out = path.join(input.workDir, `seg-${i}.mp4`);
-    await renderSceneSegment(scene, entries[i].length, input.grade, out);
+    await renderSceneSegment(scene, entries[i].length, input.grade, out, input.dims);
     segments.push(out);
   }
   return composeFinal({ ...input, segments });
+}
+
+/**
+ * Long videos: joins the rendered parts (same codec settings → stream copy for video), then lays one
+ * continuous generated music bed under the whole thing (ducked under the voice) and normalises loudness.
+ * Audio-only processing, so it stays fast even for 10+ minute videos.
+ */
+export async function assembleParts(input: { workDir: string; parts: string[]; musicMood: MusicMood | null; musicVolume: number; outFile: string; onProgress?: (label: string) => Promise<void> | void }) {
+  const { workDir } = input;
+  const list = path.join(workDir, "parts.txt");
+  await writeFile(list, input.parts.map((file) => `file '${path.resolve(file).replace(/'/g, "'\\''")}'`).join("\n"));
+  const joined = path.join(workDir, "joined.mp4");
+  await input.onProgress?.("Joining parts");
+  await runFfmpeg(["-f", "concat", "-safe", "0", "-i", list, "-c", "copy", "-movflags", "+faststart", joined], 280_000, workDir);
+  const info = await probe(joined);
+  const total = info.duration;
+  const args = ["-i", joined];
+  let graph: string;
+  if (input.musicMood && input.musicVolume > 0) {
+    await input.onProgress?.("Music bed and loudness");
+    const licensed = await licensedMusic(input.musicMood);
+    const musicFile = licensed ?? path.join(workDir, "music.wav");
+    if (!licensed) await renderMusic(input.musicMood, total, musicFile);
+    args.push("-stream_loop", "-1", "-i", musicFile);
+    const vol = ((input.musicVolume / 100) * 0.9).toFixed(3);
+    graph = `[0:a]aresample=48000,asplit=2[main][sc];[1:a]aresample=48000,aformat=channel_layouts=stereo,atrim=0:${total.toFixed(3)},volume=${vol}[mus];[mus][sc]sidechaincompress=threshold=0.025:ratio=7:attack=15:release=350[duck];[main][duck]amix=inputs=2:normalize=0:duration=first,afade=t=out:st=${Math.max(0, total - 1.5).toFixed(3)}:d=1.5,loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[aout]`;
+  } else {
+    graph = `[0:a]afade=t=out:st=${Math.max(0, total - 1.5).toFixed(3)}:d=1.5,loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[aout]`;
+  }
+  await runFfmpeg([...args, "-filter_complex", graph, "-map", "0:v", "-map", "[aout]", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-t", total.toFixed(3), "-movflags", "+faststart", path.resolve(input.outFile)], 280_000, workDir);
+  return { duration: total };
 }

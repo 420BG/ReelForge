@@ -22,6 +22,8 @@ export const VOICES = [
   { id: "sage", label: "Sage — calm (female)" },
   { id: "atlas", label: "Atlas — deep documentary (male)" },
   { id: "orion", label: "Orion — cinematic calm (male)" },
+  { id: "aura-2-thalia-en", label: "Thalia — Deepgram HD (female, needs DEEPGRAM_API_KEY)" },
+  { id: "aura-2-orion-en", label: "Orion HD — Deepgram (male, needs DEEPGRAM_API_KEY)" },
 ];
 
 const STEPS = ["Topic", "Format", "Settings", "Review"];
@@ -32,12 +34,16 @@ export default function Create() {
   const { overview, notify, refresh } = useAgent();
   const niches = overview?.niches ?? [];
   const [step, setStep] = useState(1);
-  const [tab, setTab] = useState<"suggested" | "niches" | "custom">("suggested");
+  const [tab, setTab] = useState<"suggested" | "niches" | "custom" | "script">(params?.get("mode") === "script" ? "script" : "suggested");
+  const [script, setScript] = useState("");
   const [niche, setNiche] = useState(params?.get("niche") ?? "motivation");
+  const initialFormat = params?.get("format") === "long" ? "long" : "short";
   const [topic, setTopic] = useState(params?.get("topic") ?? "");
   const [custom, setCustom] = useState("");
   const [search, setSearch] = useState("");
-  const [settings, setSettings] = useState<VideoSettings>(DEFAULT_VIDEO_SETTINGS);
+  const [settings, setSettings] = useState<VideoSettings>({ ...DEFAULT_VIDEO_SETTINGS, format: initialFormat, targetDuration: initialFormat === "long" ? 300 : DEFAULT_VIDEO_SETTINGS.targetDuration });
+  const long = settings.format === "long";
+  const setFormat = (format: "short" | "long") => setSettings((s) => ({ ...s, format, targetDuration: format === "long" ? 300 : 30 }));
   const [busy, setBusy] = useState<"plan" | "produce" | null>(null);
   const current = niches.find((n) => n.id === niche);
 
@@ -52,7 +58,10 @@ export default function Create() {
     return q ? list.filter((item) => item.topic.toLowerCase().includes(q)) : list;
   }, [tab, niches, current, search]);
 
-  const idea = tab === "custom" ? custom.trim() : topic;
+  const scriptWords = script.trim() ? script.trim().split(/\s+/).length : 0;
+  const scriptSeconds = Math.round(scriptWords / 2.5);
+  const scriptMode = tab === "script";
+  const idea = scriptMode ? (scriptWords >= 8 ? script.trim().split(/\s+/).slice(0, 12).join(" ") : "") : tab === "custom" ? custom.trim() : topic;
   const set = <K extends keyof VideoSettings>(key: K, value: VideoSettings[K]) => setSettings((s) => ({ ...s, [key]: value }));
 
   const randomTopic = () => {
@@ -68,7 +77,7 @@ export default function Create() {
     if (!idea) { notify("Pick or type a topic first.", "error"); setStep(1); return; }
     setBusy(mode);
     try {
-      const data = await api<{ video: AgentVideo; note: string | null }>("/api/agent/videos", post({ niche, mode, settings: { ...settings, idea } }));
+      const data = await api<{ video: AgentVideo; note: string | null }>("/api/agent/videos", post({ niche, mode: scriptMode ? "produce" : mode, settings: { ...settings, idea: scriptMode ? undefined : idea, script: scriptMode ? script : undefined } }));
       notify(data.note ?? (mode === "plan" ? "Storyboard ready — review and edit it." : "Production started."));
       void refresh(true);
       router.push(`/studio/videos/${data.video.id}`);
@@ -98,12 +107,19 @@ export default function Create() {
           <div>
             <h2 className="mb-4 font-display text-lg font-bold">1. Choose a topic</h2>
             <div className="mb-4 flex gap-2">
-              {([["suggested", "Suggested"], ["niches", "By niche"], ["custom", "Custom"]] as const).map(([id, label]) => <Chip key={id} on={tab === id} onClick={() => setTab(id)}>{label}</Chip>)}
+              {([["suggested", "Suggested"], ["niches", "By niche"], ["custom", "Story from idea"], ["script", "My script"]] as const).map(([id, label]) => <Chip key={id} on={tab === id} onClick={() => setTab(id)}>{label}</Chip>)}
             </div>
             {tab === "niches" && (
               <div className="mb-4 flex flex-wrap gap-2">{niches.map((n) => <Chip key={n.id} on={niche === n.id} onClick={() => setNiche(n.id)}>{n.emoji} {n.label}</Chip>)}</div>
             )}
-            {tab === "custom" ? (
+            {tab === "script" ? (
+              <div className="space-y-3">
+                <p className="rounded-xl border border-lime/20 bg-lime/[0.04] p-3 text-[11px] leading-relaxed text-mute"><b className="text-cream">Script mode:</b> your words are the narration, exactly as written. The AI only designs a matching image and camera move for each line. Use “Story from idea” if you want the AI to write the story.</p>
+                <div className="flex flex-wrap gap-2">{niches.map((n) => <Chip key={n.id} on={niche === n.id} onClick={() => setNiche(n.id)}>{n.emoji} {n.label}</Chip>)}</div>
+                <textarea value={script} onChange={(e) => { setScript(e.target.value); const secs = Math.round(e.target.value.trim().split(/\s+/).length / 2.5); if (secs > 170 && settings.format === "short") setSettings((s) => ({ ...s, format: "long" })); }} rows={10} maxLength={15000} placeholder="Paste your full narration script here…" className="w-full rounded-xl border border-white/12 bg-white/[0.04] p-3 text-sm leading-relaxed outline-none placeholder:text-dim focus:border-lime/50" />
+                <p className="text-[11px] text-dim">{scriptWords} words · about {scriptSeconds >= 90 ? `${Math.round(scriptSeconds / 60)} min` : `${scriptSeconds}s`} of narration · {scriptSeconds > 170 ? "will be a Long (16:9) video" : "fits a Short — or pick Long in the next step"}</p>
+              </div>
+            ) : tab === "custom" ? (
               <div className="space-y-3">
                 <div className="flex flex-wrap gap-2">{niches.map((n) => <Chip key={n.id} on={niche === n.id} onClick={() => setNiche(n.id)}>{n.emoji} {n.label}</Chip>)}</div>
                 <textarea value={custom} onChange={(e) => setCustom(e.target.value)} rows={4} maxLength={400} placeholder="Describe your video idea, e.g. “a night-shift guard hears his own voice on the radio”" className="w-full rounded-xl border border-white/12 bg-white/[0.04] p-3 text-sm outline-none placeholder:text-dim focus:border-lime/50" />
@@ -121,7 +137,7 @@ export default function Create() {
                       <button key={`${item.niche.id}-${item.topic}`} type="button" onClick={() => { setTopic(item.topic); setNiche(item.niche.id); }}
                         className={`flex w-full items-center gap-3 rounded-2xl border px-3 py-3 text-left transition ${on ? "border-lime/60 bg-lime/[0.06] shadow-[0_0_0_1px_rgba(217,255,77,0.25)]" : "border-white/[0.07] bg-white/[0.02] hover:border-white/20"}`}>
                         <span className="grid h-10 w-10 place-items-center rounded-xl bg-white/[0.05] text-lg">{item.niche.emoji}</span>
-                        <span className="min-w-0 flex-1"><span className="block truncate text-sm font-bold">{item.topic}</span><span className="block text-[11px] text-dim">{item.niche.label} · 9:16</span></span>
+                        <span className="min-w-0 flex-1"><span className="block truncate text-sm font-bold">{item.topic}</span><span className="block text-[11px] text-dim">{item.niche.label} · {long ? "16:9" : "9:16"}</span></span>
                         {on ? <CheckCircle2 className="h-5 w-5 text-lime" /> : <ArrowRight className="h-4 w-4 text-dim" />}
                       </button>
                     );
@@ -139,14 +155,15 @@ export default function Create() {
             <div>
               <p className="mb-2 text-xs font-semibold text-mute">Choose format</p>
               <div className="grid grid-cols-2 gap-3">
-                <div className="rounded-2xl border border-lime/60 bg-lime/[0.06] p-4"><p className="font-bold">Short · 9:16</p><p className="text-[11px] text-dim">1080×1920 MP4 for YouTube Shorts</p></div>
-                <div className="rounded-2xl border border-white/[0.07] p-4 opacity-50"><p className="font-bold">Long · 16:9</p><p className="text-[11px] text-dim">Use the Classic studio</p></div>
+                {([["short", "Short · 9:16", "1080×1920 for YouTube Shorts"], ["long", "Long · 16:9", "1920×1080, several minutes, written in parts"]] as const).map(([id, label, hint]) => (
+                  <button key={id} type="button" onClick={() => setFormat(id)} className={`rounded-2xl border p-4 text-left transition ${settings.format === id ? "border-lime/60 bg-lime/[0.06]" : "border-white/[0.07] hover:border-white/20"}`}><p className="font-bold">{label}</p><p className="text-[11px] text-dim">{hint}</p></button>
+                ))}
               </div>
             </div>
             <div>
-              <p className="mb-2 text-xs font-semibold text-mute">Duration</p>
-              <div className="grid grid-cols-4 gap-2">{[15, 30, 45, 60].map((n) => <button key={n} type="button" onClick={() => set("targetDuration", n)} className={`h-12 rounded-xl border text-sm font-bold transition ${settings.targetDuration === n ? "border-lime bg-lime text-void" : "border-white/10 text-mute hover:text-cream"}`}>{n}s</button>)}</div>
-              <p className="mt-2 text-[11px] text-dim">The final length follows the real narration, close to this target.</p>
+              <p className="mb-2 text-xs font-semibold text-mute">Duration{scriptMode ? " (follows your script)" : ""}</p>
+              {scriptMode ? <p className="rounded-xl border border-white/[0.07] px-4 py-3 text-sm">≈ {scriptSeconds >= 90 ? `${Math.round(scriptSeconds / 60)} min` : `${scriptSeconds}s`} — set by the length of your script.</p> : <div className="grid grid-cols-4 gap-2">{(long ? [180, 300, 480, 600] : [15, 30, 45, 60]).map((n) => <button key={n} type="button" onClick={() => set("targetDuration", n)} className={`h-12 rounded-xl border text-sm font-bold transition ${settings.targetDuration === n ? "border-lime bg-lime text-void" : "border-white/10 text-mute hover:text-cream"}`}>{long ? `${n / 60} min` : `${n}s`}</button>)}</div>}
+              <p className="mt-2 text-[11px] text-dim">{long ? `About ${Math.round(settings.targetDuration / 9)} scenes (one AI image each), written in ${Math.max(2, Math.round(settings.targetDuration / 60))} parts. Progress is saved after every part and scene.` : "The final length follows the real narration, close to this target."}</p>
             </div>
           </div>
         )}
@@ -164,7 +181,7 @@ export default function Create() {
             </div>
             <label className="block">
               <span className="mb-2 block text-xs font-semibold text-mute">Narration voice</span>
-              <select value={settings.voiceId ?? ""} onChange={(e) => setSettings((s) => ({ ...s, voiceId: e.target.value || undefined, voiceProvider: e.target.value ? "free" : "auto" }))} className="h-11 w-full rounded-xl border border-white/12 bg-ink px-3 text-sm outline-none focus:border-lime/50">
+              <select value={settings.voiceId ?? ""} onChange={(e) => setSettings((s) => ({ ...s, voiceId: e.target.value || undefined, voiceProvider: e.target.value ? (e.target.value.startsWith("aura") ? "deepgram" : "free") : "auto" }))} className="h-11 w-full rounded-xl border border-white/12 bg-ink px-3 text-sm outline-none focus:border-lime/50">
                 {VOICES.map((v) => <option key={v.id} value={v.id}>{v.label}</option>)}
               </select>
             </label>
@@ -185,10 +202,6 @@ export default function Create() {
                 <span>Quality</span>
                 <div className="flex gap-1.5"><Chip on={settings.quality === "draft"} onClick={() => set("quality", "draft")}>Low-cost draft</Chip><Chip on={settings.quality === "production"} onClick={() => set("quality", "production")}>Production</Chip></div>
               </div>
-              <div className="flex items-center justify-between px-4 py-3 text-sm">
-                <span>IMAGE MODE fallback {overview && !overview.config.allowImageMode && <span className="text-[11px] text-dim">(enable in Settings)</span>}</span>
-                <Toggle on={settings.allowImageMode} onChange={(on) => set("allowImageMode", on && Boolean(overview?.config.allowImageMode))} label="Image mode" />
-              </div>
             </div>
           </div>
         )}
@@ -198,17 +211,17 @@ export default function Create() {
             <h2 className="font-display text-lg font-bold">4. Review</h2>
             <dl className="divide-y divide-white/[0.06] rounded-2xl border border-white/[0.07] text-sm">
               {[
-                ["Topic", idea || "—"],
+                [scriptMode ? "Mode" : "Topic", scriptMode ? `Script mode — your ${scriptWords} words, unchanged` : idea || "—"],
                 ["Niche", current ? `${current.emoji} ${current.label}` : niche],
                 ["Audience", current?.audience === "kids" ? "Made for kids" : "General (not made for kids)"],
-                ["Format", `Short · 9:16 · ~${settings.targetDuration}s`],
+                ["Format", long ? `Long · 16:9 · ~${Math.round(settings.targetDuration / 60)} min` : `Short · 9:16 · ~${settings.targetDuration}s`],
                 ["Style", STYLES.find((s) => s.id === settings.style)?.label ?? settings.style],
                 ["Voice", VOICES.find((v) => v.id === (settings.voiceId ?? ""))?.label ?? "Match the niche"],
-                ["Video provider", overview?.status.providers.find((p) => p.configured)?.label ?? (settings.allowImageMode ? "IMAGE MODE (stills + motion)" : "Not configured")],
+                ["Visuals", (() => { const ai = overview?.status.providers.find((p) => p.usable); return ai && overview?.config.aiVideoScenes !== "none" ? `AI image per scene → ${ai.label} image-to-video (falls back to camera motion)` : "AI image per scene + camera motion"; })()],
               ].map(([k, v]) => <div key={k} className="flex justify-between gap-4 px-4 py-2.5"><dt className="text-dim">{k}</dt><dd className="text-right font-semibold">{v}</dd></div>)}
             </dl>
             <div className="grid gap-2 sm:grid-cols-2">
-              <Button variant="outline" busy={busy === "plan"} disabled={busy !== null} onClick={() => void submit("plan")}><Sparkles className="h-4 w-4" /> Write storyboard first</Button>
+              {!long && !scriptMode && <Button variant="outline" busy={busy === "plan"} disabled={busy !== null} onClick={() => void submit("plan")}><Sparkles className="h-4 w-4" /> Write storyboard first</Button>}
               <Button busy={busy === "produce"} disabled={busy !== null} onClick={() => void submit("produce")}><Play className="h-4 w-4" /> Produce now</Button>
             </div>
             <p className="text-[11px] text-dim">Nothing is published automatically — every video waits for your approval.</p>

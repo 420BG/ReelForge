@@ -4,7 +4,9 @@ export type ClipRequest = {
   prompt: string;
   negativePrompt?: string;
   durationSec: number;
-  aspectRatio: "9:16";
+  aspectRatio: "9:16" | "16:9";
+  /** Public https URL of the keyframe, for providers that only accept URLs (Luma). */
+  imageUrl?: string;
   seed?: number;
   /** data: URL of a keyframe for image-to-video (character/scene consistency). */
   imageDataUrl?: string;

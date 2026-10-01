@@ -1,6 +1,7 @@
 import { writeFile } from "node:fs/promises";
 import type { VoiceId } from "@/lib/generator";
 import { narrate } from "@/lib/pipeline/tts";
+import { cloudflareConfigured } from "@/content/story-engine/llm";
 import type { NicheDefinition } from "@/content/niches/registry";
 import type { VideoSettings, VoiceStyle } from "@/content/types";
 import { probe, runFfmpeg } from "@/video/composition/ffmpeg";
@@ -41,17 +42,52 @@ const FREE_VOICES: Record<VoiceStyle, { female: VoiceId; male: VoiceId }> = {
 };
 const FREE_IDS = ["nova", "atlas", "orion", "lyra", "sage"];
 
-export type VoicePlan = { provider: "free" | "pollinations" | "elevenlabs"; voiceId: string; style: VoiceStyle; gender: "female" | "male"; pace: number };
+/** Deepgram Aura-2 voices (new accounts get free credits). */
+const DEEPGRAM: Record<VoiceStyle, { female: string; male: string }> = {
+  horror: { female: "aura-2-luna-en", male: "aura-2-orion-en" },
+  storytelling: { female: "aura-2-thalia-en", male: "aura-2-arcas-en" },
+  calm: { female: "aura-2-luna-en", male: "aura-2-orion-en" },
+  excited: { female: "aura-2-thalia-en", male: "aura-2-arcas-en" },
+  documentary: { female: "aura-2-thalia-en", male: "aura-2-orion-en" },
+  warm: { female: "aura-2-luna-en", male: "aura-2-arcas-en" },
+};
 
-export function voiceProviderAvailable(settings: VideoSettings): "free" | "pollinations" | "elevenlabs" | null {
+export type VoiceProviderId = "free" | "deepgram" | "pollinations" | "elevenlabs";
+export type VoicePlan = { provider: VoiceProviderId; voiceId: string; style: VoiceStyle; gender: "female" | "male"; pace: number };
+
+/**
+ * Picks the narrator. Auto order: Deepgram (free credits) → Pollinations Kokoro → ElevenLabs → free relays.
+ * Whatever is picked, a failure (no credits, outage) falls back to the free voices — narration never blocks a video.
+ */
+export function voiceProviderAvailable(settings: VideoSettings): VoiceProviderId | null {
   if (settings.voiceProvider === "none") return null;
   if (settings.voiceProvider === "free") return "free";
-  if (settings.voiceProvider === "elevenlabs") return process.env.ELEVENLABS_API_KEY ? "elevenlabs" : null;
-  if (settings.voiceProvider === "pollinations") return process.env.POLLINATIONS_API_KEY ? "pollinations" : null;
-  if (process.env.ELEVENLABS_API_KEY && settings.voiceId && !/^[a-z]{2}_[a-z]+$/.test(settings.voiceId)) return "elevenlabs";
+  if (settings.voiceProvider === "deepgram") return process.env.DEEPGRAM_API_KEY ? "deepgram" : "free";
+  if (settings.voiceProvider === "elevenlabs") return process.env.ELEVENLABS_API_KEY ? "elevenlabs" : "free";
+  if (settings.voiceProvider === "pollinations") return process.env.POLLINATIONS_API_KEY ? "pollinations" : "free";
+  if (process.env.ELEVENLABS_API_KEY && settings.voiceId && !/^[a-z]{2}_[a-z]+$/.test(settings.voiceId) && !settings.voiceId.startsWith("aura")) return "elevenlabs";
+  if (process.env.DEEPGRAM_API_KEY) return "deepgram";
   if (process.env.POLLINATIONS_API_KEY) return "pollinations";
   if (process.env.ELEVENLABS_API_KEY) return "elevenlabs";
   return "free";
+}
+
+async function deepgramTts(text: string, model: string): Promise<Buffer> {
+  let response: Response;
+  try {
+    response = await fetch(`https://api.deepgram.com/v1/speak?model=${encodeURIComponent(model)}&encoding=mp3`, {
+      method: "POST",
+      headers: { Authorization: `Token ${process.env.DEEPGRAM_API_KEY ?? ""}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ text: text.slice(0, 1900) }),
+      signal: AbortSignal.timeout(60_000), cache: "no-store",
+    });
+  } catch (error) {
+    throw new ProviderError(`Deepgram unreachable (${error instanceof Error ? error.message : "network"}).`, true);
+  }
+  if (!response.ok) throw new ProviderError(`Deepgram returned ${response.status}.`, httpRetryable(response.status), response.status);
+  const bytes = Buffer.from(await response.arrayBuffer());
+  if (bytes.length < 800) throw new ProviderError("Deepgram returned an empty clip.", true);
+  return bytes;
 }
 
 let elevenCache: { at: number; voices: { id: string; gender: string }[] } | null = null;
@@ -79,6 +115,10 @@ export async function planVoice(settings: VideoSettings, niche: NicheDefinition)
     const voiceId = settings.voiceId && FREE_IDS.includes(settings.voiceId) ? settings.voiceId : FREE_VOICES[style][gender];
     return { provider, voiceId, style, gender, pace: niche.voice.pace };
   }
+  if (provider === "deepgram") {
+    const voiceId = settings.voiceId?.startsWith("aura") ? settings.voiceId : process.env.DEEPGRAM_VOICE || DEEPGRAM[style][gender];
+    return { provider, voiceId, style, gender, pace: niche.voice.pace };
+  }
   if (provider === "pollinations") {
     const voiceId = settings.voiceId && /^[a-z]{2}_[a-z]+$/.test(settings.voiceId) ? settings.voiceId : KOKORO[style][gender];
     return { provider, voiceId, style, gender, pace: niche.voice.pace };
@@ -90,10 +130,16 @@ export async function planVoice(settings: VideoSettings, niche: NicheDefinition)
 async function fetchVoice(plan: VoicePlan, text: string, voiceId: string, workFile: string): Promise<Buffer> {
   if (plan.provider === "free") {
     const { readFile } = await import("node:fs/promises");
-    const result = await narrate(text, voiceId as VoiceId, workFile);
-    if (!result.provider) throw new ProviderError("Free narration relays are unavailable right now.", true);
-    return readFile(workFile);
+    const result = await narrate(text, voiceId as VoiceId, workFile).catch(() => ({ provider: null }));
+    if (result.provider) return readFile(workFile);
+    // Backups when the free relays are down: Deepgram (free credits), then Cloudflare MeloTTS.
+    if (process.env.DEEPGRAM_API_KEY && (voiceBrokeUntil.get("deepgram") ?? 0) < Date.now()) {
+      try { return await deepgramTts(text, DEEPGRAM[plan.style][plan.gender]); } catch { /* next backup */ }
+    }
+    if (cloudflareConfigured()) return cloudflareTts(text);
+    throw new ProviderError("Free narration relays are unavailable right now.", true);
   }
+  if (plan.provider === "deepgram") return deepgramTts(text, voiceId);
   let response: Response;
   try {
     if (plan.provider === "elevenlabs") {
@@ -118,17 +164,58 @@ async function fetchVoice(plan: VoicePlan, text: string, voiceId: string, workFi
   return bytes;
 }
 
+/** Cloudflare Workers AI MeloTTS — free daily allowance, single English voice. Returns MP3 bytes. */
+async function cloudflareTts(text: string): Promise<Buffer> {
+  let response: Response;
+  try {
+    response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${process.env.CLOUDFLARE_ACCOUNT_ID}/ai/run/@cf/myshell-ai/melotts`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: text.slice(0, 600), lang: "en" }),
+      signal: AbortSignal.timeout(60_000), cache: "no-store",
+    });
+  } catch (error) {
+    throw new ProviderError(`Cloudflare TTS unreachable (${error instanceof Error ? error.message : "network"}).`, true);
+  }
+  if (!response.ok) throw new ProviderError(`Cloudflare TTS returned ${response.status}.`, httpRetryable(response.status), response.status);
+  const type = response.headers.get("content-type") || "";
+  let bytes: Buffer;
+  if (type.startsWith("audio/")) bytes = Buffer.from(await response.arrayBuffer());
+  else {
+    const data = await response.json().catch(() => null) as { result?: { audio?: string }; audio?: string } | null;
+    const b64 = data?.result?.audio ?? data?.audio;
+    if (!b64) throw new ProviderError("Cloudflare TTS returned no audio.", true);
+    bytes = Buffer.from(b64, "base64");
+  }
+  if (bytes.length < 800) throw new ProviderError("Cloudflare TTS returned an empty clip.", true);
+  return bytes;
+}
+
+/** A keyed voice provider that ran out of credits is skipped for an hour (this server instance). */
+const voiceBrokeUntil = new Map<string, number>();
+
+function freePlan(plan: VoicePlan): VoicePlan {
+  return { ...plan, provider: "free", voiceId: FREE_VOICES[plan.style][plan.gender] };
+}
+
 /** Generates one scene's narration, applies pacing for the niche, and returns the real duration. */
 export async function synthesizeNarration(plan: VoicePlan, text: string, outFile: string, workFile: string): Promise<{ duration: number; voiceId: string }> {
+  if (plan.provider !== "free" && (voiceBrokeUntil.get(plan.provider) ?? 0) > Date.now()) plan = freePlan(plan);
   let voiceId = plan.voiceId;
   let bytes: Buffer;
   try {
     bytes = await fetchVoice(plan, text, voiceId, workFile);
   } catch (error) {
     // Unknown Kokoro voice ids come back as 4xx — fall back to the voice the app already uses.
-    if (plan.provider === "pollinations" && error instanceof ProviderError && !error.retryable && voiceId !== KOKORO_FALLBACK) {
+    if (plan.provider === "pollinations" && error instanceof ProviderError && !error.retryable && voiceId !== KOKORO_FALLBACK && error.status !== 401 && error.status !== 402 && error.status !== 403) {
       voiceId = KOKORO_FALLBACK;
-      bytes = await fetchVoice(plan, text, voiceId, workFile);
+      bytes = await fetchVoice(plan, text, voiceId, workFile).catch(() => fetchVoice(freePlan(plan), text, freePlan(plan).voiceId, workFile));
+    } else if (plan.provider !== "free") {
+      if (error instanceof ProviderError && [401, 402, 403].includes(error.status ?? 0)) voiceBrokeUntil.set(plan.provider, Date.now() + 3_600_000);
+      // Paid/keyed voice failed (no credits, outage…): use the free voices rather than failing the video.
+      const free = freePlan(plan);
+      voiceId = free.voiceId;
+      bytes = await fetchVoice(free, text, voiceId, workFile);
     } else throw error;
   }
   await writeFile(workFile, bytes);

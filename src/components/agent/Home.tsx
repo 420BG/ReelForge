@@ -2,16 +2,28 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useMemo } from "react";
-import { AlertTriangle, ArrowRight, Dices, Pause, Play, Sparkles } from "lucide-react";
+import { useMemo, useState } from "react";
+import { AlertTriangle, ArrowRight, Clapperboard, Dices, Film, Pause, Play, Send, Sparkles } from "lucide-react";
+import type { AgentVideo } from "@/content/types";
 import { useStudio } from "@/components/studio/StudioContext";
 import { timeUntil } from "@/components/studio/StudioApp";
-import { greeting, useAgent } from "./data";
+import { api, greeting, post, useAgent } from "./data";
 import { Button, Empty, NavIcon, Panel, PanelTitle, Progress, VideoCard } from "./ui";
 
 export default function Home() {
   const router = useRouter();
-  const { overview, error } = useAgent();
+  const { overview, error, notify, refresh } = useAgent();
+  const [generating, setGenerating] = useState<"short" | "long" | null>(null);
+  async function generate(format: "short" | "long") {
+    setGenerating(format);
+    try {
+      const data = await api<{ video: AgentVideo; note: string | null }>("/api/agent/generate", post({ format }));
+      notify(data.note ?? (format === "long" ? "Long video started — it keeps going in the background." : "Short started — it keeps going in the background."));
+      void refresh(true);
+      router.push(`/studio/videos/${data.video.id}`);
+    } catch (err) { notify(err instanceof Error ? err.message : "Could not start.", "error"); }
+    finally { setGenerating(null); }
+  }
   const { series, autopilotActive, toggleAllAutopilot } = useStudio();
 
   const nextRun = useMemo(() => {
@@ -27,7 +39,12 @@ export default function Home() {
     router.push(`/studio/create?niche=${niche.id}&topic=${encodeURIComponent(topic)}`);
   };
 
-  const provider = overview?.status.providers.find((p) => p.configured);
+  const [idea, setIdea] = useState("");
+  const ask = (text: string) => { const message = text.trim(); if (message) router.push(`/studio/chat?q=${encodeURIComponent(message.slice(0, 600))}`); };
+
+  const aiVideo = overview?.status.providers.find((p) => p.usable);
+  const daily = overview?.config.daily;
+  const today = overview?.status.daily;
   const job = overview?.jobs[0];
 
   return (
@@ -42,11 +59,45 @@ export default function Home() {
           </div>
         </div>
 
+        {/* One click: story → AI images → motion → voice → captions → music → edit → final video */}
+        <Panel className="!p-4">
+          <div className="grid grid-cols-2 gap-3">
+            <button type="button" disabled={generating !== null} onClick={() => void generate("short")} className="group rounded-2xl border border-lime/40 bg-lime/[0.07] p-4 text-left transition hover:bg-lime/[0.12] disabled:opacity-60">
+              <span className="flex items-center gap-2 font-display text-base font-bold text-lime"><Clapperboard className="h-4 w-4" />{generating === "short" ? "Starting…" : "Generate Short"}</span>
+              <span className="mt-1 block text-[11px] text-mute">9:16 · ~45 s · one click</span>
+            </button>
+            <button type="button" disabled={generating !== null} onClick={() => void generate("long")} className="group rounded-2xl border border-violet/40 bg-violet/[0.08] p-4 text-left transition hover:bg-violet/[0.14] disabled:opacity-60">
+              <span className="flex items-center gap-2 font-display text-base font-bold text-violet-soft"><Film className="h-4 w-4" />{generating === "long" ? "Starting…" : "Generate Long"}</span>
+              <span className="mt-1 block text-[11px] text-mute">16:9 · ~{daily?.longMinutes ?? 5} min · written in parts</span>
+            </button>
+          </div>
+          <p className="mt-3 text-[11px] leading-relaxed text-dim">
+            <Link href="/studio/settings" className={`mr-1.5 inline-block rounded-md px-1.5 py-0.5 text-[9px] font-black tracking-wide ${overview?.config.freeMode !== false ? "bg-emerald-400/15 text-emerald-300" : "bg-amber-300/20 text-amber-200"}`}>{overview?.config.freeMode !== false ? "FREE MODE ON" : "PAID PROVIDERS ALLOWED"}</Link>
+            AI story → an AI image for every scene → {aiVideo && overview?.config.aiVideoScenes !== "none" ? `${aiVideo.label} image-to-video (camera motion when out of quota)` : "camera motion"} → voice → captions → music & SFX → edited final video.
+            {daily && (daily.short || daily.long) ? <> Daily: {[daily.short && `Short ${daily.shortTime}${today?.short ? " ✓" : ""}`, daily.long && `Long ${daily.longTime}${today?.long ? " ✓" : ""}`].filter(Boolean).join(" · ")}.</> : <> <Link href="/studio/settings" className="font-semibold text-lime">Turn on the daily Short + Long</Link>.</>}
+          </p>
+        </Panel>
+
+        {/* Chat box — type an idea, the AI writes the script + storyboard in AI Chat. */}
+        <Panel className="!p-4">
+          <p className="mb-2.5 flex items-center gap-2 text-xs font-bold text-mute"><NavIcon name="chat" className="h-4 w-4 text-lime" /> What should we make today?</p>
+          <form onSubmit={(e) => { e.preventDefault(); ask(idea); }} className="flex items-end gap-2 rounded-2xl border border-white/10 bg-void/60 p-1.5 pl-4 focus-within:border-lime/40">
+            <textarea value={idea} onChange={(e) => setIdea(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); ask(idea); } }}
+              rows={2} maxLength={600} placeholder="e.g. A 45 second scary story about a lighthouse keeper, dark cinematic, male voice"
+              className="min-h-[44px] flex-1 resize-none bg-transparent py-2 text-sm outline-none placeholder:text-dim" />
+            <button type="submit" disabled={!idea.trim()} aria-label="Send to AI" className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-lime text-void disabled:opacity-40"><Send className="h-4 w-4" /></button>
+          </form>
+          <div className="mt-2.5 flex gap-2 overflow-x-auto pb-0.5">
+            {["30s motivation about discipline", "Scary story at 3 AM", "Psychology fact: why we procrastinate", "Kids bedtime story about a brave cloud"].map((text) => (
+              <button key={text} type="button" onClick={() => ask(`Create a ${text}`)} className="shrink-0 rounded-full border border-white/10 bg-white/[0.02] px-3 py-1.5 text-[11px] font-semibold text-mute transition hover:border-lime/40 hover:text-cream">{text}</button>
+            ))}
+          </div>
+        </Panel>
+
         {error && <div className="flex items-center gap-2 rounded-2xl border border-red-400/30 bg-red-400/10 px-4 py-3 text-sm text-red-200"><AlertTriangle className="h-4 w-4" />{error}</div>}
-        {overview && !provider && (
+        {overview && today && !today.background && overview.jobs.length > 0 && (
           <div className="rounded-2xl border border-amber-300/25 bg-amber-300/[0.07] px-4 py-3 text-xs leading-relaxed text-amber-100">
-            <strong>No AI video provider configured.</strong> {overview.config.allowImageMode ? "New videos will render in IMAGE MODE (stills with camera motion, clearly labelled)." : "Add a POLLINATIONS_API_KEY in Vercel, or allow IMAGE MODE in "}
-            {!overview.config.allowImageMode && <Link href="/studio/settings" className="font-bold text-lime underline">Settings</Link>}
+            <strong>Keep this page open while it renders</strong> — or add a <code>CRON_SECRET</code> environment variable in Vercel so generation continues in the background.
           </div>
         )}
 

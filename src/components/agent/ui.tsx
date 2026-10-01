@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import type { ReactNode } from "react";
-import { Film, Loader2 } from "lucide-react";
+import { Film, Loader2, Trash2 } from "lucide-react";
 import type { AgentVideo, Workflow } from "@/content/types";
 import { fileUrl, formatDuration } from "./data";
 
@@ -119,31 +119,51 @@ export function StatusPill({ workflow }: { workflow: Workflow }) {
 
 export function ModeBadge({ video }: { video: Pick<AgentVideo, "renderMode"> }) {
   if (!video.renderMode) return null;
-  return video.renderMode === "video"
-    ? <span className="rounded-md bg-lime px-1.5 py-0.5 text-[9px] font-black tracking-wide text-void">AI VIDEO</span>
-    : <span className="rounded-md bg-amber-300 px-1.5 py-0.5 text-[9px] font-black tracking-wide text-void">IMAGE MODE</span>;
+  if (video.renderMode === "video") return <span className="rounded-md bg-lime px-1.5 py-0.5 text-[9px] font-black tracking-wide text-void">AI VIDEO</span>;
+  if (video.renderMode === "stock") return <span className="rounded-md bg-sky-300 px-1.5 py-0.5 text-[9px] font-black tracking-wide text-void">STOCK VIDEO</span>;
+  if (video.renderMode === "mixed") return <span className="rounded-md bg-violet-soft px-1.5 py-0.5 text-[9px] font-black tracking-wide text-void">AI IMAGES + VIDEO</span>;
+  return <span className="rounded-md bg-amber-300 px-1.5 py-0.5 text-[9px] font-black tracking-wide text-void">AI IMAGES</span>;
 }
 
-export function VideoCard({ video, compact = false }: { video: AgentVideo; compact?: boolean }) {
+export function VideoCard({ video, compact = false, onDelete, selectMode = false, selected = false, onSelect }: {
+  video: AgentVideo; compact?: boolean; onDelete?: (video: AgentVideo) => void; selectMode?: boolean; selected?: boolean; onSelect?: (video: AgentVideo) => void;
+}) {
   const running = video.job && ["queued", "running", "waiting"].includes(video.job.state);
-  return (
-    <Link href={`/studio/videos/${video.id}`} className="group block overflow-hidden rounded-2xl border border-white/[0.07] bg-white/[0.02] transition hover:border-lime/30">
+  const body = (
+    <>
       <div className="relative aspect-[9/16] w-full overflow-hidden bg-ink">
         {video.hasCover
           ? <img src={fileUrl(video.id, "cover", `&v=${encodeURIComponent(video.updatedAt)}`)} alt="" className="h-full w-full object-cover transition duration-500 group-hover:scale-[1.03]" />
           : <div className="grid h-full w-full place-items-center bg-gradient-to-b from-violet/20 to-void text-dim"><Film className="h-7 w-7" /></div>}
         <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/85 to-transparent p-2.5 pt-10">
           <p className={`font-display font-bold leading-tight text-cream ${compact ? "text-[11px]" : "text-sm"} line-clamp-2`}>{video.title || "Writing story…"}</p>
-          <p className="mt-0.5 text-[10px] text-mute">9:16 · {formatDuration(video.durationSec ?? video.settings.targetDuration)}</p>
+          <p className="mt-0.5 text-[10px] text-mute">{video.settings.format === "long" ? "Long · 16:9" : "Short · 9:16"} · {formatDuration(video.durationSec ?? video.settings.targetDuration)}</p>
         </div>
         <div className="absolute left-2 top-2"><ModeBadge video={video} /></div>
+        {selectMode && (
+          <span className={`absolute right-2 top-2 grid h-6 w-6 place-items-center rounded-full border-2 text-[11px] font-black ${selected ? "border-lime bg-lime text-void" : "border-white/70 bg-black/40 text-transparent"}`}>✓</span>
+        )}
       </div>
       <div className="flex items-center justify-between gap-2 px-2.5 py-2">
         <StatusPill workflow={video.workflow} />
         {video.youtubeVideoId && <span className="text-[10px] font-bold text-red-400">YouTube</span>}
       </div>
       {running && video.job && <div className="px-2.5 pb-2.5"><Progress value={video.job.progress} /></div>}
-    </Link>
+    </>
+  );
+  const frame = `group relative block overflow-hidden rounded-2xl border bg-white/[0.02] transition ${selected ? "border-lime/70" : "border-white/[0.07] hover:border-lime/30"}`;
+  return (
+    <div className="relative">
+      {selectMode
+        ? <button type="button" onClick={() => onSelect?.(video)} className={`${frame} w-full text-left`}>{body}</button>
+        : <Link href={`/studio/videos/${video.id}`} className={frame}>{body}</Link>}
+      {onDelete && !selectMode && (
+        <button type="button" aria-label="Delete video" onClick={() => onDelete(video)}
+          className="absolute right-2 top-2 grid h-8 w-8 place-items-center rounded-full bg-black/55 text-red-300 backdrop-blur transition hover:bg-red-500/80 hover:text-white">
+          <Trash2 className="h-4 w-4" />
+        </button>
+      )}
+    </div>
   );
 }
 

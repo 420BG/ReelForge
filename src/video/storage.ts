@@ -30,6 +30,7 @@ export const storageKey = {
   keyframe: (videoId: string, index: number) => (checkId(videoId), `${videoId}/scenes/keyframe-${index}.jpg`),
   voice: (videoId: string, index: number) => (checkId(videoId), `${videoId}/audio/voice-${index}.mp3`),
   segment: (videoId: string, index: number) => (checkId(videoId), `${videoId}/segments/seg-${index}.mp4`),
+  part: (videoId: string, index: number) => (checkId(videoId), `${videoId}/parts/part-${index}.mp4`),
   final: (videoId: string) => (checkId(videoId), `${videoId}/final.mp4`),
   cover: (videoId: string) => (checkId(videoId), `${videoId}/cover.jpg`),
 };
@@ -182,7 +183,7 @@ export async function removeVideoMedia(videoId: string) {
   if (storageBackend() === "supabase") {
     try {
       const keys = [
-        ...(await sbList(`${videoId}/scenes`)), ...(await sbList(`${videoId}/audio`)), ...(await sbList(`${videoId}/segments`)), ...(await sbList(videoId)),
+        ...(await sbList(`${videoId}/scenes`)), ...(await sbList(`${videoId}/audio`)), ...(await sbList(`${videoId}/segments`)), ...(await sbList(`${videoId}/parts`)), ...(await sbList(videoId)),
       ];
       if (keys.length) {
         await fetch(`${sbBase()}/object/${encodeURIComponent(bucket())}`, { method: "DELETE", headers: sbHeaders({ "Content-Type": "application/json" }), body: JSON.stringify({ prefixes: keys.map((key) => `${PREFIX}${key}`) }), cache: "no-store" });

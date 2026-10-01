@@ -65,6 +65,9 @@ function Frame({ children }: { children: ReactNode }) {
           <Link href="/studio" className="lg:hidden"><BrandMark /></Link>
           <span className="hidden text-xs font-semibold text-dim lg:block">{NAV.find((item) => isActive(pathname, item.href))?.label ?? "Studio"}</span>
           <div className="flex items-center gap-2">
+            <Link href="/studio/chat" aria-label="AI Chat" className={`grid h-9 w-9 place-items-center rounded-full border lg:hidden ${pathname.startsWith("/studio/chat") ? "border-lime/50 text-lime" : "border-white/10 text-mute hover:text-cream"}`}>
+              <NavIcon name="chat" className="h-4 w-4" />
+            </Link>
             {autopilotActive && <span className="hidden items-center gap-1.5 rounded-full border border-lime/30 px-2.5 py-1 text-[10px] font-bold text-lime sm:flex"><NavIcon name="bolt" className="h-3 w-3" />Auto-pilot</span>}
             <Link href="/studio/videos" aria-label="Activity" className="relative grid h-9 w-9 place-items-center rounded-full border border-white/10 text-mute hover:text-cream">
               <NavIcon name="bell" className="h-4 w-4" />

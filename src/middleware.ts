@@ -15,7 +15,7 @@ export async function middleware(req: NextRequest) {
   // automatically when CRON_SECRET is set — accept that, plus a custom
   // `x-cron-secret` header for any external scheduler (cron-job.org, GitHub
   // Actions, etc.) hitting the same route.
-  if (pathname === "/api/cron") {
+  if (pathname === "/api/cron" || pathname === "/api/agent/kick") {
     const bearer = req.headers.get("authorization");
     const custom = req.headers.get("x-cron-secret");
     const expected = process.env.CRON_SECRET;

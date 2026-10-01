@@ -1,4 +1,5 @@
 import type { AgentConfig } from "@/content/types";
+import { assertProviderAllowed } from "@/video/providers/policy";
 import { downloadMedia, httpRetryable, ProviderError, type ClipPoll, type ClipRequest, type ClipSubmission, type VideoProvider } from "@/video/providers/types";
 
 /** Replicate predictions API (optional, paid). Model + extra input are configurable. */
@@ -34,11 +35,13 @@ export const replicateVideo: VideoProvider = {
   capabilities: { textToVideo: true, imageToVideo: true, clipDurations: [5, 6, 10], seed: true, negativePrompt: false },
   isConfigured: () => Boolean(process.env.REPLICATE_API_TOKEN),
   async submit(request: ClipRequest, config: AgentConfig): Promise<ClipSubmission> {
+    // PAID provider: refuses to run unless Free Mode is off AND this provider is enabled (second lock).
+    assertProviderAllowed("replicate", Boolean(process.env.REPLICATE_API_TOKEN), config);
     const model = request.imageDataUrl ? config.models.replicate.imageToVideo : config.models.replicate.textToVideo;
     if (!/^[\w.-]+\/[\w.-]+$/.test(model)) throw new ProviderError("Set a valid Replicate model (owner/name) in Agent settings.", false);
     const input: Record<string, unknown> = {
       prompt: request.prompt,
-      aspect_ratio: "9:16",
+      aspect_ratio: request.aspectRatio,
       duration: request.durationSec > 7 ? 10 : 5,
       seed: request.seed,
       ...(request.imageDataUrl ? { first_frame_image: request.imageDataUrl, image: request.imageDataUrl } : {}),
@@ -51,7 +54,8 @@ export const replicateVideo: VideoProvider = {
     if (typeof getUrl !== "string" || !getUrl.startsWith("https://api.replicate.com/")) throw new ProviderError("Replicate did not return a prediction URL.", true);
     return { status: "pending", ref: getUrl };
   },
-  async poll(ref: string): Promise<ClipPoll> {
+  async poll(ref: string, config: AgentConfig): Promise<ClipPoll> {
+    assertProviderAllowed("replicate", Boolean(process.env.REPLICATE_API_TOKEN), config);
     if (!ref.startsWith("https://api.replicate.com/")) return { status: "failed", error: "Invalid Replicate job reference.", retryable: false };
     const response = await fetch(ref, { headers: headers(), signal: AbortSignal.timeout(30_000), cache: "no-store" });
     if (!response.ok) return httpRetryable(response.status) ? { status: "pending" } : { status: "failed", error: `Replicate status ${response.status}`, retryable: false };

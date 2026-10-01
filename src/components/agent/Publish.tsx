@@ -68,8 +68,8 @@ export default function Publish({ id }: { id: string }) {
 
       <div className="grid gap-5 md:grid-cols-[220px_1fr]">
         <div className="overflow-hidden rounded-2xl border border-white/[0.08] bg-ink">
-          {video.hasCover ? <img src={fileUrl(video.id, "cover")} alt="" className="aspect-[9/16] w-full object-cover" /> : <div className="grid aspect-[9/16] place-items-center text-dim"><Film className="h-6 w-6" /></div>}
-          <div className="p-3 text-[11px] text-dim"><p className="font-bold text-cream">{video.title}</p>{formatDuration(video.durationSec)} · 9:16 · {video.niche}</div>
+          {video.hasCover ? <img src={fileUrl(video.id, "cover")} alt="" className={`${video.settings.format === "long" ? "aspect-video" : "aspect-[9/16]"} w-full object-cover`} /> : <div className="grid aspect-[9/16] place-items-center text-dim"><Film className="h-6 w-6" /></div>}
+          <div className="p-3 text-[11px] text-dim"><p className="font-bold text-cream">{video.title}</p>{formatDuration(video.durationSec)} · {video.settings.format === "long" ? "16:9" : "9:16"} · {video.niche}</div>
         </div>
 
         <Panel>
@@ -83,7 +83,7 @@ export default function Publish({ id }: { id: string }) {
             <>
               {step === 1 && (
                 <div className="space-y-3">
-                  <label className="block text-xs font-semibold text-mute">Title<input maxLength={95} value={seo.title} onChange={(e) => setSeo({ ...seo, title: e.target.value })} className="mt-1 h-11 w-full rounded-xl border border-white/12 bg-white/[0.04] px-3 text-sm text-cream outline-none focus:border-lime/50" /><span className="text-[10px] text-dim">{seo.title.length}/95 · “#Shorts” is added on upload</span></label>
+                  <label className="block text-xs font-semibold text-mute">Title<input maxLength={95} value={seo.title} onChange={(e) => setSeo({ ...seo, title: e.target.value })} className="mt-1 h-11 w-full rounded-xl border border-white/12 bg-white/[0.04] px-3 text-sm text-cream outline-none focus:border-lime/50" /><span className="text-[10px] text-dim">{seo.title.length}/95{video.settings.format === "long" ? " · long video (16:9)" : " · “#Shorts” is added on upload"}</span></label>
                   <label className="block text-xs font-semibold text-mute">Description<textarea rows={5} value={seo.description} onChange={(e) => setSeo({ ...seo, description: e.target.value })} className="mt-1 w-full rounded-xl border border-white/12 bg-white/[0.04] p-3 text-sm text-cream outline-none focus:border-lime/50" /></label>
                   <label className="block text-xs font-semibold text-mute">Tags<input value={seo.tags.join(", ")} onChange={(e) => setSeo({ ...seo, tags: e.target.value.split(",").map((t) => t.trim()).filter(Boolean) })} className="mt-1 h-11 w-full rounded-xl border border-white/12 bg-white/[0.04] px-3 text-sm text-cream outline-none focus:border-lime/50" /></label>
                   <label className="block text-xs font-semibold text-mute">Hashtags<input value={seo.hashtags.join(" ")} onChange={(e) => setSeo({ ...seo, hashtags: e.target.value.split(/\s+/).filter(Boolean) })} className="mt-1 h-11 w-full rounded-xl border border-white/12 bg-white/[0.04] px-3 text-sm text-cream outline-none focus:border-lime/50" /></label>
@@ -94,7 +94,7 @@ export default function Publish({ id }: { id: string }) {
               {step === 2 && (
                 <div className="space-y-2 text-sm text-mute">
                   <p>The cover on the left is generated from your first scene with the title burned in.</p>
-                  <p className="text-[11px] text-dim">For Shorts, YouTube picks the thumbnail from the video frames; custom thumbnail upload for Shorts isn&apos;t supported by the YouTube API.</p>
+                  <p className="text-[11px] text-dim">{video.settings.format === "long" ? "Download the cover and set it as the custom thumbnail in YouTube Studio (custom thumbnails need a verified channel)." : "For Shorts, YouTube picks the thumbnail from the video frames; custom thumbnail upload for Shorts isn't supported by the YouTube API."}</p>
                   {video.hasCover && <Button variant="outline" href={fileUrl(video.id, "cover", "&download=1")} className="text-xs">Download cover</Button>}
                 </div>
               )}
@@ -110,7 +110,7 @@ export default function Publish({ id }: { id: string }) {
                   {!yt.connected && <div className="flex gap-2 rounded-xl border border-amber-300/25 bg-amber-300/[0.07] p-3 text-xs text-amber-100"><AlertTriangle className="h-4 w-4 shrink-0" /> Connect YouTube first on the <Link href="/studio/youtube" className="font-bold text-lime underline">YouTube page</Link>.</div>}
                   {!video.hasFinal && <p className="text-xs text-red-300">Render the video before publishing.</p>}
                   <dl className="divide-y divide-white/[0.06] rounded-2xl border border-white/[0.07]">
-                    {[["Title", `${seo.title} #Shorts`], ["Visibility", privacy], ["Channel", yt.channelTitle ?? (yt.connected ? "Connected" : "Not connected")]].map(([k, v]) => <div key={k} className="flex justify-between gap-3 px-4 py-2.5"><dt className="text-dim">{k}</dt><dd className="truncate text-right font-semibold">{v}</dd></div>)}
+                    {[["Title", video.settings.format === "long" ? seo.title : `${seo.title} #Shorts`], ["Visibility", privacy], ["Channel", yt.channelTitle ?? (yt.connected ? "Connected" : "Not connected")]].map(([k, v]) => <div key={k} className="flex justify-between gap-3 px-4 py-2.5"><dt className="text-dim">{k}</dt><dd className="truncate text-right font-semibold">{v}</dd></div>)}
                   </dl>
                   <Button onClick={() => void publish()} busy={busy} disabled={!canPublish || !yt.connected} className="w-full"><Upload className="h-4 w-4" /> Approve & publish to YouTube</Button>
                 </div>

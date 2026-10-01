@@ -62,25 +62,28 @@ export function buildCaptionEvents(cue: CaptionCue, settings: CaptionSettings) {
   return lines;
 }
 
-export function buildAss(cues: CaptionCue[], settings: CaptionSettings, fontFamily: string, hook?: { text: string; until: number }) {
-  const size = Math.max(48, Math.min(140, Math.round(settings.size)));
+export function buildAss(cues: CaptionCue[], settings: CaptionSettings, fontFamily: string, hook?: { text: string; until: number }, dims: { width: number; height: number } = { width: 1080, height: 1920 }) {
+  const landscape = dims.width > dims.height;
+  // Landscape (long videos): smaller type, lower third, wider side margins.
+  const size = Math.round(Math.max(48, Math.min(140, Math.round(settings.size))) * (landscape ? 0.78 : 1));
   const alignment = settings.position === "top" ? 8 : settings.position === "center" ? 5 : 2;
-  const marginV = settings.position === "center" ? 0 : settings.position === "top" ? 300 : 380;
+  const marginV = settings.position === "center" ? 0 : settings.position === "top" ? (landscape ? 70 : 300) : landscape ? 95 : 380;
+  const sideMargin = landscape ? 220 : 70;
   const karaoke = settings.animation === "karaoke";
   const primary = karaoke ? assColor(settings.highlight) : assColor(settings.color);
   const secondary = karaoke ? assColor(settings.color) : assColor(settings.highlight);
   const header = [
     "[Script Info]",
     "ScriptType: v4.00+",
-    "PlayResX: 1080",
-    "PlayResY: 1920",
+    `PlayResX: ${dims.width}`,
+    `PlayResY: ${dims.height}`,
     "WrapStyle: 0",
     "ScaledBorderAndShadow: yes",
     "",
     "[V4+ Styles]",
     "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-    `Style: Caption,${fontFamily},${size},${primary},${secondary},&H00000000,&H96000000,-1,0,0,0,100,100,1,0,1,8,3,${alignment},70,70,${marginV},1`,
-    `Style: Hook,${fontFamily},${Math.round(size * 1.05)},${assColor(settings.highlight)},${assColor(settings.color)},&H00000000,&H64000000,-1,0,0,0,100,100,1,0,1,6,2,8,80,80,250,1`,
+    `Style: Caption,${fontFamily},${size},${primary},${secondary},&H00000000,&H96000000,-1,0,0,0,100,100,1,0,1,8,3,${alignment},${sideMargin},${sideMargin},${marginV},1`,
+    `Style: Hook,${fontFamily},${Math.round(size * 1.05)},${assColor(settings.highlight)},${assColor(settings.color)},&H00000000,&H64000000,-1,0,0,0,100,100,1,0,1,6,2,8,80,80,${landscape ? 90 : 250},1`,
     "",
     "[Events]",
     "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",

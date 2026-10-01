@@ -5,11 +5,23 @@ import type { AgentConfig, AgentJob, AgentVideo, VisualStyle, Workflow } from "@
 
 /* Shared client data for the Agent screens: one poll loop for the whole studio. */
 
+export type ProviderHealth = { calls: number; failures: number; exhausted: boolean } | null;
+export type FreeProvider = { id: string; label?: string; model?: string; env?: string; configured: boolean; health?: ProviderHealth };
 export type NicheSummary = {
   id: string; label: string; emoji: string; description: string; audience: "general" | "kids";
   subNiches: { id: string; label: string }[]; defaultStyle: VisualStyle; pacing: string; topics: string[];
 };
-export type ProviderInfo = { id: string; label: string; paid: boolean; configured: boolean; capabilities: { textToVideo: boolean; imageToVideo: boolean }; pricePerSecond: number | null };
+export type ProviderInfo = {
+  id: string; label: string; paid: boolean; tier?: "free" | "free-tier" | "paid"; configured: boolean; enabled?: boolean; usable?: boolean;
+  status?: "ready" | "enabled" | "not-configured" | "disabled" | "blocked-free-mode"; reason?: string;
+  capabilities: { textToVideo: boolean; imageToVideo: boolean }; pricePerSecond: number | null; health?: ProviderHealth;
+};
+export type FreeUsage = {
+  target: { short: number; long: number };
+  videos: { short: { started: number; finished: number }; long: { started: number; finished: number } };
+  remaining: { short: number; long: number };
+  aiCallsToday: number; paidCallsToday: number; outOfQuota: string[]; note: string;
+};
 export type ActiveJob = AgentJob & { title: string; niche: string; provider: string | null };
 export type Overview = {
   counts: Record<Workflow | "total", number>;
@@ -22,7 +34,12 @@ export type Overview = {
   niches: NicheSummary[];
   status: {
     providers: ProviderInfo[]; textModel: boolean; voice: { free: boolean; pollinations: boolean; elevenlabs: boolean };
-    imageMode: { allowed: boolean; available: boolean }; ffmpeg: boolean; youtubeConnected: boolean; youtubeChannelTitle: string | null; worker: string;
+    imageMode: { allowed: boolean; available: boolean }; stockMode?: { allowed: boolean; available: boolean };
+    free?: { text: FreeProvider[]; images: FreeProvider[]; stock: FreeProvider[]; voice: FreeProvider[] };
+    daily?: { short: string | null; long: string | null; background: boolean };
+    freeMode?: boolean;
+    freeUsage?: FreeUsage;
+    ffmpeg: boolean; youtubeConnected: boolean; youtubeChannelTitle: string | null; worker: string;
   };
 };
 
@@ -80,9 +97,12 @@ export function AgentDataProvider({ children }: { children: ReactNode }) {
   const active = (overview?.jobs.length ?? 0) > 0;
   useEffect(() => { void refresh(); }, [refresh]);
   useEffect(() => {
-    const id = window.setInterval(() => { void refresh(active); }, active ? 5000 : 20000);
+    // Poll less when idle, retry quickly after a failed first load, and pause while the tab is hidden
+    // (each poll uses a database connection).
+    const every = active ? 5000 : error && !overview ? 6000 : 20000;
+    const id = window.setInterval(() => { if (!document.hidden) void refresh(active); }, every);
     return () => window.clearInterval(id);
-  }, [refresh, active]);
+  }, [refresh, active, error, overview]);
 
   return <AgentCtx.Provider value={{ overview, error, refresh, notify, toast }}>{children}</AgentCtx.Provider>;
 }

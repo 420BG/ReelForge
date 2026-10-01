@@ -1,15 +1,22 @@
 import { getNiche, NICHES } from "@/content/niches/registry";
 import { generateStoryPlan } from "@/content/story-engine";
+import { completeJson, textModelAvailable } from "@/content/story-engine/llm";
 import type { VisualStyle } from "@/content/types";
 import { fail, guard } from "@/jobs/api-helpers";
-import { createVideo, getConfig, getVideo, normalizeVideoSettings, recentTitles } from "@/jobs/repo";
+import { createVideo, enqueueJob, getConfig, getVideo, normalizeVideoSettings, recentTitles } from "@/jobs/repo";
+import { continueInBackground } from "@/jobs/worker";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
 
-/* Reads a plain-language request ("Create a 1 minute cinematic video about discipline")
-   into niche / length / style, writes the storyboard, and returns it as a draft to review. */
+/**
+ * AI Chat. A normal conversational assistant (uses the free model chain) that can ALSO make videos:
+ *  - "make a 30s horror short about…"  → story-mode draft storyboard (review, then Produce)
+ *  - "make a 5 minute video about…"    → long video queued
+ *  - a pasted script + "use this"      → SCRIPT MODE (your words, unchanged) queued
+ * Anything else is just answered, like any chat assistant.
+ */
 
 const NICHE_WORDS: [RegExp, string][] = [
   [/\b(horror|scary|creepy|haunt|ghost|paranormal|3\s?am|nightmare|urban legend)/i, "horror"],
@@ -23,14 +30,15 @@ const NICHE_WORDS: [RegExp, string][] = [
   [/\b(kids?|children|bedtime|cartoon for kids)/i, "kids"],
   [/\b(sci-?fi|fantasy|dystopian|thriller|fiction|story about a|dragon|robot)/i, "fiction"],
 ];
+const STYLES: VisualStyle[] = ["cinematic", "dark-cinematic", "animation-3d", "anime", "realistic", "storybook"];
 
 function parseDuration(text: string) {
   const minutes = /(\d+(?:\.\d+)?)\s*(?:-|\s)?(?:min|minute)/i.exec(text);
   if (minutes) return Math.round(Number(minutes[1]) * 60);
   if (/\b(one|a)\s+minute/i.test(text)) return 60;
-  const seconds = /(\d{2})\s*(?:-|\s)?(?:s\b|sec|second)/i.exec(text);
+  const seconds = /(\d{2,3})\s*(?:-|\s)?(?:s\b|sec|second)/i.exec(text);
   if (seconds) return Number(seconds[1]);
-  return 30;
+  return 0;
 }
 
 function parseStyle(text: string, fallback: VisualStyle): VisualStyle {
@@ -43,33 +51,99 @@ function parseStyle(text: string, fallback: VisualStyle): VisualStyle {
   return fallback;
 }
 
+/** Pulls the script body out of "Make a video from this script: <script>". */
+function extractScript(message: string) {
+  const match = /^[^\n]{0,160}?(?:script|narration|story|text)\s*(?:below|here|is)?\s*[:\-—]\s*\n?([\s\S]{40,})$/i.exec(message.trim());
+  if (match) return match[1].trim();
+  const lines = message.trim().split("\n");
+  if (lines.length > 2 && lines[0].split(/\s+/).length < 25 && /\b(make|create|use|turn|video|script)\b/i.test(lines[0])) return lines.slice(1).join("\n").trim();
+  return message.trim();
+}
+
+type Turn = { role: "user" | "agent"; text: string };
+type Decision = { reply: string; action: "none" | "short" | "long" | "script"; niche?: string; idea?: string; seconds?: number; style?: string; voice?: string };
+
+async function decide(message: string, history: Turn[]): Promise<Decision | null> {
+  if (!textModelAvailable()) return null;
+  const niches = NICHES.map((n) => `${n.id} (${n.label})`).join(", ");
+  const transcript = history.slice(-10).map((turn) => `${turn.role === "user" ? "User" : "Assistant"}: ${turn.text.slice(0, 800)}`).join("\n");
+  try {
+    const { json } = await completeJson(
+      [
+        "You are ReelForge AI, a friendly and knowledgeable assistant inside a faceless YouTube video studio.",
+        "Chat naturally like a helpful AI assistant: answer questions, brainstorm ideas, write or improve scripts and hooks, explain YouTube growth, SEO and the app. Be concise and warm; use plain text (no markdown tables).",
+        "You can also START a video, but ONLY when the user clearly asks to make/create/generate/produce a video now.",
+        `Actions: "short" = vertical Short (≤60 s) where the AI writes the story; "long" = 16:9 multi-minute video (AI writes it); "script" = the user supplied their own narration script and wants a video made from it word for word; "none" = just chat.`,
+        `Niches: ${niches}. Styles: ${STYLES.join(", ")}.`,
+      ].join("\n"),
+      `${transcript ? `Conversation so far:\n${transcript}\n\n` : ""}User: ${message.slice(0, 6000)}
+Return ONLY JSON: {"reply":"your chat reply to the user","action":"none|short|long|script","niche":"niche id","idea":"one-sentence video idea (for short/long)","seconds":30,"style":"style id","voice":"female|male|auto"}`,
+      2000,
+    );
+    const action = ["short", "long", "script"].includes(String(json.action)) ? (json.action as Decision["action"]) : "none";
+    return { reply: String(json.reply ?? "").slice(0, 3000), action, niche: String(json.niche ?? ""), idea: String(json.idea ?? ""), seconds: Number(json.seconds) || 0, style: String(json.style ?? ""), voice: String(json.voice ?? "") };
+  } catch {
+    return null;
+  }
+}
+
 export async function POST(request: Request) {
   const denied = await guard();
   if (denied) return denied;
   try {
     const body = await request.json().catch(() => ({}));
-    const message = typeof body.message === "string" ? body.message.trim().slice(0, 600) : "";
-    if (message.length < 4) return Response.json({ error: "Tell me what the video should be about." }, { status: 400 });
-    const nicheId = NICHE_WORDS.find(([pattern]) => pattern.test(message))?.[1] ?? (typeof body.niche === "string" && NICHES.some((n) => n.id === body.niche) ? body.niche : "motivation");
-    const niche = getNiche(nicheId);
-    const targetDuration = [15, 30, 45, 60].reduce((best, n) => (Math.abs(n - parseDuration(message)) < Math.abs(best - parseDuration(message)) ? n : best), 30);
+    const message = typeof body.message === "string" ? body.message.trim().slice(0, 16000) : "";
+    if (message.length < 2) return Response.json({ error: "Type a message." }, { status: 400 });
+    const history: Turn[] = Array.isArray(body.history) ? body.history.filter((turn: Turn) => turn && typeof turn.text === "string" && (turn.role === "user" || turn.role === "agent")).slice(-10) : [];
     const config = await getConfig();
-    const settings = normalizeVideoSettings({
-      targetDuration,
-      style: parseStyle(message, niche.defaultStyle),
-      voiceGender: /\bfemale|woman\b/i.test(message) ? "female" : /\bmale|man\b/i.test(message) ? "male" : "auto",
-      idea: message,
-      audience: niche.audience,
-      allowImageMode: config.allowImageMode,
-    });
+    const origin = new URL(request.url).origin;
+
+    const wantsVideo = /\b(make|create|generate|produce|render|build)\b[\s\S]{0,60}\b(video|short|reel|clip|story)\b/i.test(message);
+    const decision = (await decide(message, history)) ?? {
+      // No model reachable: fall back to the simple rules (video requests only).
+      reply: wantsVideo ? "" : "I can't reach a chat model right now (all free AI providers are busy or no key is set). I can still make videos — tell me what to make, e.g. “Make a 30 second scary story”.",
+      action: wantsVideo ? (message.split(/\s+/).length > 90 ? "script" : parseDuration(message) >= 90 || /\blong\b/i.test(message) ? "long" : "short") : "none",
+    } as Decision;
+
+    if (decision.action === "none") return Response.json({ reply: decision.reply || "…", note: null, video: null });
+
+    const nicheId = NICHES.some((n) => n.id === decision.niche) ? decision.niche! : NICHE_WORDS.find(([pattern]) => pattern.test(message))?.[1] ?? "motivation";
+    const niche = getNiche(nicheId);
+    const style = STYLES.includes(decision.style as VisualStyle) ? (decision.style as VisualStyle) : parseStyle(message, niche.defaultStyle);
+    const voiceGender = decision.voice === "female" || /\bfemale|woman\b/i.test(message) ? "female" : decision.voice === "male" || /\bmale|man\b/i.test(message) ? "male" : "auto";
+
+    if (decision.action === "script") {
+      const script = extractScript(message);
+      const seconds = Math.round(script.split(/\s+/).length / 2.5);
+      const settings = normalizeVideoSettings({ format: seconds > 170 || /\blong\b/i.test(message) ? "long" : "short", script, style, voiceGender, audience: niche.audience });
+      const created = await createVideo({ niche: niche.id, settings, audience: niche.audience });
+      await enqueueJob(created.id, "story", "Queued from AI Chat (script mode).");
+      continueInBackground(origin);
+      const reply = `${decision.reply ? `${decision.reply}\n\n` : ""}Making a ${settings.format === "long" ? `${Math.round(settings.targetDuration / 60)}-minute 16:9` : `${settings.targetDuration}-second vertical`} video from your script — your words stay exactly as written; I'm only designing an AI image and camera move for each line.`;
+      return Response.json({ reply, note: null, video: await getVideo(created.id) }, { status: 201 });
+    }
+
+    const asked = decision.seconds || parseDuration(message);
+    if (decision.action === "long" || asked >= 90) {
+      const settings = normalizeVideoSettings({ format: "long", targetDuration: Math.max(120, Math.min(900, asked >= 90 ? asked : config.daily.longMinutes * 60)), style, voiceGender, idea: decision.idea || message.slice(0, 400), audience: niche.audience });
+      const created = await createVideo({ niche: niche.id, settings, audience: niche.audience });
+      await enqueueJob(created.id, "story", "Queued from AI Chat (long video).");
+      continueInBackground(origin);
+      const reply = `${decision.reply ? `${decision.reply}\n\n` : ""}Started a ${Math.round(settings.targetDuration / 60)}-minute ${niche.label.toLowerCase()} video (16:9). I'll outline it, write it part by part, make an AI image for every scene, animate them, add voice, captions and music, then edit it together. Progress is saved as it goes.`;
+      return Response.json({ reply, note: null, video: await getVideo(created.id) }, { status: 201 });
+    }
+
+    const targetDuration = [15, 30, 45, 60].reduce((best, n) => (Math.abs(n - (asked || 30)) < Math.abs(best - (asked || 30)) ? n : best), 30);
+    const idea = decision.idea || message.slice(0, 400);
+    const settings = normalizeVideoSettings({ targetDuration, style, voiceGender, idea, audience: niche.audience });
     const { plan, note } = await generateStoryPlan({
-      niche: niche.id, idea: message, targetDuration: settings.targetDuration, style: settings.style,
+      niche: niche.id, idea, targetDuration: settings.targetDuration, style: settings.style,
       maxScenes: config.maxScenesPerVideo, timezone: config.timezone, voiceGender: settings.voiceGender, avoidTitles: await recentTitles(20),
     });
+    plan.format = "short";
     const created = await createVideo({ niche: niche.id, subNiche: plan.subNiche, settings, story: plan, audience: niche.audience });
-    const video = await getVideo(created.id);
-    const reply = `Here's the plan for a ${settings.targetDuration}-second ${niche.label.toLowerCase()} Short: “${plan.title}”. ${plan.scenes.length} scenes, ${settings.style.replace("-", " ")} style, ${settings.voiceGender === "auto" ? "narrator matched to the niche" : `${settings.voiceGender} narrator`}. Review it, then press Produce.`;
-    return Response.json({ reply, note, video }, { status: 201 });
+    const reply = `${decision.reply ? `${decision.reply}\n\n` : ""}Here's the plan for a ${settings.targetDuration}-second ${niche.label.toLowerCase()} Short: “${plan.title}” — ${plan.scenes.length} scenes, ${settings.style.replace("-", " ")} style. Review it, then press Produce.`;
+    return Response.json({ reply, note, video: await getVideo(created.id) }, { status: 201 });
   } catch (error) {
     return fail(error);
   }

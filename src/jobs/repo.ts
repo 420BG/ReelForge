@@ -23,6 +23,33 @@ const clampInt = (value: unknown, min: number, max: number, fallback: number) =>
   return Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : fallback;
 };
 
+function normalizeProviderSwitches(input: unknown): AgentConfig["providers"] {
+  const value = (typeof input === "object" && input !== null ? input : {}) as Record<string, { enabled?: unknown } | undefined>;
+  const base = DEFAULT_AGENT_CONFIG.providers;
+  // Paid providers are enabled only when explicitly set to true; free-tier ones follow their default unless set.
+  return {
+    pollinations: { enabled: value.pollinations?.enabled === undefined ? base.pollinations.enabled : value.pollinations.enabled === true },
+    fal: { enabled: value.fal?.enabled === true },
+    replicate: { enabled: value.replicate?.enabled === true },
+    luma: { enabled: value.luma?.enabled === true },
+    runway: { enabled: value.runway?.enabled === true },
+  };
+}
+
+function normalizeDaily(input: unknown): AgentConfig["daily"] {
+  const value = (typeof input === "object" && input !== null ? input : {}) as Partial<AgentConfig["daily"]>;
+  const hhmm = (v: unknown, fallback: string) => (typeof v === "string" && /^([01]\d|2[0-3]):[0-5]\d$/.test(v) ? v : fallback);
+  const base = DEFAULT_AGENT_CONFIG.daily;
+  return {
+    short: value.short === true,
+    long: value.long === true,
+    shortTime: hhmm(value.shortTime, base.shortTime),
+    longTime: hhmm(value.longTime, base.longTime),
+    niche: typeof value.niche === "string" && /^[a-z-]{2,30}$/.test(value.niche) ? value.niche : "auto",
+    longMinutes: clampInt(value.longMinutes, 2, 15, base.longMinutes),
+  };
+}
+
 export function normalizeConfig(input: unknown): AgentConfig {
   const value = (typeof input === "object" && input !== null ? input : {}) as Partial<AgentConfig> & Record<string, unknown>;
   const models = (value.models ?? {}) as Partial<AgentConfig["models"]>;
@@ -37,14 +64,22 @@ export function normalizeConfig(input: unknown): AgentConfig {
     maxClipSeconds: [5, 10].includes(Number(value.maxClipSeconds)) ? Number(value.maxClipSeconds) : DEFAULT_AGENT_CONFIG.maxClipSeconds,
     dailyClipLimit: clampInt(value.dailyClipLimit, 1, 500, DEFAULT_AGENT_CONFIG.dailyClipLimit),
     autoPublishEnabled: value.autoPublishEnabled === true,
+    // Kept for older saved settings; AI images + motion are now always the baseline visual.
     allowImageMode: value.allowImageMode === true,
-    defaultProvider: ["auto", "pollinations", "fal", "replicate"].includes(String(value.defaultProvider)) ? (value.defaultProvider as AgentConfig["defaultProvider"]) : "auto",
+    allowStockVideo: value.allowStockVideo === true,
+    // FREE MODE is on unless it was explicitly switched off (with confirmation).
+    freeMode: value.freeMode !== false,
+    providers: normalizeProviderSwitches(value.providers),
+    allowPaidVideo: false,
+    aiVideoScenes: (["all", "hook", "none"] as const).includes(value.aiVideoScenes as "all") ? (value.aiVideoScenes as AgentConfig["aiVideoScenes"]) : "all",
+    daily: normalizeDaily(value.daily),
+    defaultProvider: ["auto", "pollinations", "fal", "replicate", "luma", "runway"].includes(String(value.defaultProvider)) ? (value.defaultProvider as AgentConfig["defaultProvider"]) : "auto",
     models: {
       pollinations: { video: text(models.pollinations?.video, ""), image: text(models.pollinations?.image, "flux") || "flux" },
       fal: { textToVideo: text(models.fal?.textToVideo, DEFAULT_AGENT_CONFIG.models.fal.textToVideo), imageToVideo: text(models.fal?.imageToVideo, DEFAULT_AGENT_CONFIG.models.fal.imageToVideo), extraInput: extra(models.fal?.extraInput) },
       replicate: { textToVideo: text(models.replicate?.textToVideo, DEFAULT_AGENT_CONFIG.models.replicate.textToVideo), imageToVideo: text(models.replicate?.imageToVideo, DEFAULT_AGENT_CONFIG.models.replicate.imageToVideo), extraInput: extra(models.replicate?.extraInput) },
     },
-    pricePerSecond: { pollinations: priceOf(price.pollinations), fal: priceOf(price.fal), replicate: priceOf(price.replicate) },
+    pricePerSecond: { pollinations: priceOf(price.pollinations), fal: priceOf(price.fal), replicate: priceOf(price.replicate), luma: priceOf(price.luma), runway: priceOf(price.runway) },
     timezone: typeof value.timezone === "string" && /^[A-Za-z_]+\/[A-Za-z_/-]+$|^UTC$/.test(value.timezone) ? value.timezone : DEFAULT_AGENT_CONFIG.timezone,
   };
 }
@@ -56,7 +91,7 @@ export async function getConfig(): Promise<AgentConfig> {
 
 export async function saveConfig(patch: Partial<AgentConfig>): Promise<AgentConfig> {
   const current = await getConfig();
-  const next = normalizeConfig({ ...current, ...patch, models: { ...current.models, ...(patch.models ?? {}) }, pricePerSecond: { ...current.pricePerSecond, ...(patch.pricePerSecond ?? {}) } });
+  const next = normalizeConfig({ ...current, ...patch, models: { ...current.models, ...(patch.models ?? {}) }, pricePerSecond: { ...current.pricePerSecond, ...(patch.pricePerSecond ?? {}) }, daily: { ...current.daily, ...(patch.daily ?? {}) }, providers: { ...current.providers, ...(patch.providers ?? {}) } });
   await q("INSERT INTO agent_settings (id, config, updated_at) VALUES (1, $1, now()) ON CONFLICT (id) DO UPDATE SET config = EXCLUDED.config, updated_at = now()", [JSON.stringify(next)]);
   return next;
 }
@@ -66,14 +101,21 @@ export function normalizeVideoSettings(input: unknown, base: VideoSettings = DEF
   const captions = { ...DEFAULT_CAPTIONS, ...base.captions, ...(typeof value.captions === "object" && value.captions ? value.captions : {}) };
   const hex = (v: unknown, fallback: string) => (typeof v === "string" && /^#[0-9a-f]{6}$/i.test(v) ? v : fallback);
   const pick = <T extends string>(v: unknown, allowed: readonly T[], fallback: T) => (allowed.includes(v as T) ? (v as T) : fallback);
+  const format = pick(value.format ?? base.format, ["short", "long"] as const, "short");
+  const script = typeof (value.script ?? base.script) === "string" ? String(value.script ?? base.script).replace(/\r/g, "").trim().slice(0, 15000) : "";
   return {
-    targetDuration: clampInt(value.targetDuration ?? base.targetDuration, 10, 60, 30),
+    format,
+    // Shorts: 10–60 s. Long videos: 1–15 minutes.
+    // Script mode: the length follows the script (≈2.5 words per second).
+    targetDuration: script.length >= 20
+      ? (format === "long" ? clampInt(script.split(/\s+/).length / 2.5, 60, 900, 300) : clampInt(script.split(/\s+/).length / 2.5, 10, 170, 60))
+      : format === "long" ? clampInt(value.targetDuration ?? base.targetDuration, 60, 900, 300) : clampInt(value.targetDuration ?? base.targetDuration, 10, 60, 30),
     style: pick(value.style ?? base.style, ["cinematic", "dark-cinematic", "animation-3d", "anime", "realistic", "storybook"] as const, "cinematic"),
     voiceGender: pick(value.voiceGender ?? base.voiceGender, ["female", "male", "auto"] as const, "auto"),
-    voiceProvider: pick(value.voiceProvider ?? base.voiceProvider, ["auto", "free", "pollinations", "elevenlabs", "none"] as const, "auto"),
+    voiceProvider: pick(value.voiceProvider ?? base.voiceProvider, ["auto", "free", "deepgram", "pollinations", "elevenlabs", "none"] as const, "auto"),
     voiceId: typeof (value.voiceId ?? base.voiceId) === "string" && /^[a-zA-Z0-9_-]{2,80}$/.test(String(value.voiceId ?? base.voiceId)) ? String(value.voiceId ?? base.voiceId) : undefined,
     quality: pick(value.quality ?? base.quality, ["draft", "production"] as const, "production"),
-    provider: pick(value.provider ?? base.provider, ["auto", "pollinations", "fal", "replicate"] as const, "auto"),
+    provider: pick(value.provider ?? base.provider, ["auto", "pollinations", "fal", "replicate", "luma", "runway"] as const, "auto"),
     allowImageMode: Boolean(value.allowImageMode ?? base.allowImageMode),
     consistency: (value.consistency ?? base.consistency) !== false,
     captions: {
@@ -92,6 +134,7 @@ export function normalizeVideoSettings(input: unknown, base: VideoSettings = DEF
     autoPublish: Boolean(value.autoPublish ?? base.autoPublish),
     privacy: pick(value.privacy ?? base.privacy, ["private", "unlisted", "public"] as const, "private"),
     idea: typeof (value.idea ?? base.idea) === "string" ? String(value.idea ?? base.idea).slice(0, 400) : undefined,
+    script: script.length >= 20 ? script : undefined,
   };
 }
 
@@ -221,6 +264,23 @@ export async function workflowCounts() {
 }
 
 /** Videos created today / this week (owner timezone) and videos currently in the queue. */
+/** Videos started / finished today (local day) by format — for the Free Daily Usage panel. */
+export async function videosToday(timezone: string) {
+  const tz = /^[A-Za-z_]+\/[A-Za-z_/-]+$|^UTC$/.test(timezone) ? timezone : "UTC";
+  const rows = await q<{ format: string; started: string; finished: string }>(
+    `SELECT COALESCE(settings->>'format', 'short') AS format,
+       count(*)::text AS started,
+       count(*) FILTER (WHERE workflow IN ('review','approved','published'))::text AS finished
+     FROM agent_videos WHERE (created_at AT TIME ZONE $1)::date = (now() AT TIME ZONE $1)::date GROUP BY 1`,
+    [tz],
+  );
+  const pick = (format: string) => rows.find((row) => row.format === format);
+  return {
+    short: { started: Number(pick("short")?.started ?? 0), finished: Number(pick("short")?.finished ?? 0) },
+    long: { started: Number(pick("long")?.started ?? 0), finished: Number(pick("long")?.finished ?? 0) },
+  };
+}
+
 export async function activityCounts(timezone: string) {
   const tz = /^[A-Za-z_]+\/[A-Za-z_/-]+$|^UTC$/.test(timezone) ? timezone : "UTC";
   const [row] = await q<{ today: string; week: string; queue: string }>(
@@ -373,4 +433,16 @@ export async function usageToday() {
 export async function createBatch(config: Record<string, unknown>) {
   const [row] = await q<{ id: string }>("INSERT INTO agent_batches (config) VALUES ($1) RETURNING id", [JSON.stringify(config)]);
   return row.id;
+}
+
+/** Today's per-provider calls / failures / "out of quota" flags (shared with the classic pipeline). */
+export async function providerHealth(): Promise<Record<string, { calls: number; failures: number; exhausted: boolean }>> {
+  try {
+    const rows = await q<{ provider: string; calls: number; failures: number; exhausted: number }>(
+      "SELECT provider, calls, failures, exhausted FROM provider_usage WHERE day = to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD')",
+    );
+    return Object.fromEntries(rows.map((row) => [row.provider, { calls: Number(row.calls), failures: Number(row.failures), exhausted: Number(row.exhausted) === 1 }]));
+  } catch {
+    return {};
+  }
 }

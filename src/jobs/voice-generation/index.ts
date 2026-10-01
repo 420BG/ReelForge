@@ -30,9 +30,6 @@ export async function generateVoiceStep(job: AgentJob, videoId: string, story: S
     const asset = voices.get(scene.index);
     if (asset?.status === "done" && (await storedLooksPresent(asset.path))) { done++; continue; }
     if (!scene.narration.trim()) { await upsertAsset(videoId, scene.index, "voice", { status: "skipped", mode: "audio" }); done++; continue; }
-    if (asset?.status === "failed" && asset.attempts >= config.maxAttemptsPerScene) {
-      return { state: "failed", step: "voice", currentScene: scene.index, error: `Narration for scene ${scene.index + 1} failed after ${asset.attempts} attempt(s): ${asset.error ?? "unknown"}` };
-    }
     if (asset?.next_attempt_at && new Date(asset.next_attempt_at).getTime() > Date.now()) {
       earliest = Math.min(earliest ?? Infinity, new Date(asset.next_attempt_at).getTime());
       continue;
@@ -56,8 +53,17 @@ export async function generateVoiceStep(job: AgentJob, videoId: string, story: S
         await logJob(job.id, "warn", `Scene ${scene.index + 1} narration attempt ${attempts} failed: ${message}. Retrying in ${wait}s.`);
         return { state: "waiting", step: "voice", delaySeconds: wait, currentScene: scene.index };
       }
-      await upsertAsset(videoId, scene.index, "voice", { status: "failed", mode: "audio", attempts, error: message, next_attempt_at: null });
-      return { state: "failed", step: "voice", currentScene: scene.index, error: `Narration for scene ${scene.index + 1} failed: ${message}` };
+      if (retryable) {
+        // Every voice provider is down or out of quota: keep everything, resume later instead of failing.
+        await upsertAsset(videoId, scene.index, "voice", { status: "failed", mode: "audio", attempts: 0, error: message, next_attempt_at: new Date(Date.now() + 1800 * 1000) });
+        await logJob(job.id, "warn", `Scene ${scene.index + 1}: voices unavailable right now (${message}). Progress is saved — resuming in 30 min.`);
+        return { state: "waiting", step: "voice", delaySeconds: 1800, currentScene: scene.index };
+      }
+      // This text can't be voiced (provider rejected it): captions carry the scene instead.
+      await upsertAsset(videoId, scene.index, "voice", { status: "skipped", mode: "audio", attempts, error: message, next_attempt_at: null });
+      await logJob(job.id, "warn", `Scene ${scene.index + 1}: narration skipped (${message}); captions only for this scene.`);
+      done++;
+      continue;
     }
   }
   if (earliest != null) return { state: "waiting", step: "voice", delaySeconds: Math.max(5, Math.ceil((earliest - Date.now()) / 1000)) };

@@ -1,22 +1,39 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { getNiche } from "@/content/niches/registry";
 import { generateStoryPlan } from "@/content/story-engine";
-import type { AgentConfig, AgentJob, StoryPlan, VideoSettings } from "@/content/types";
+import { canWriteLong, generateLongOutline, generateNextPart, storyComplete } from "@/content/story-engine/long";
+import { outlineFromScript, writeScriptPart } from "@/content/story-engine/script";
+import type { AgentConfig, AgentJob, PlanScene, StoryPlan, VideoSettings } from "@/content/types";
 import { generateVoiceStep } from "@/jobs/voice-generation";
 import {
   extendLease, getAssets, getConfig, getVideoRow, logJob, normalizeVideoSettings, recentTitles, recordUsage, updateVideo, upsertAsset, usageToday, type AssetRow,
 } from "@/jobs/repo";
 import { publishAgentVideo } from "@/jobs/youtube-upload";
 import { getAccount } from "@/lib/youtube";
-import { composeFinal, planTimeline, renderSceneSegment, type ComposeScene } from "@/video/composition/compose";
+import { isExhausted, markCall, markFailure } from "@/lib/pipeline/usage";
+import { assembleParts, composeFinal, dimsFor, planTimeline, renderSceneSegment, type ComposeScene, type TimelineEntry } from "@/video/composition/compose";
 import { ffmpegAvailable, probe } from "@/video/composition/ffmpeg";
 import { validateFinal } from "@/video/composition/validate";
-import { estimateCost, resolveProvider } from "@/video/providers";
-import { pollinationsImage } from "@/video/providers/pollinations";
+import { accessFor, estimateCost, getProvider, videoProviderChain } from "@/video/providers";
+import { FREE_UNAVAILABLE_MESSAGE } from "@/video/providers/policy";
+import { generateImage, ImageQuotaError } from "@/video/providers/images";
+import { stockClipFor, stockConfigured } from "@/video/providers/stock";
 import { ProviderError, type VideoProvider } from "@/video/providers/types";
-import { ensureScratch, fileExists, materialize, putFile, storageKey, storedLooksPresent } from "@/video/storage";
+import { ensureScratch, fileExists, materialize, putFile, signedUrl, storageBackend, storageKey, storedLooksPresent } from "@/video/storage";
 import { scenePrompt } from "@/video/storyboard";
+
+/**
+ * The production pipeline, one small unit of work per call (a story part, one scene image,
+ * one AI clip, one segment, one part…). Every result is saved before the next unit starts,
+ * so any interruption — a Vercel timeout, a provider running out of free quota, a crash —
+ * resumes exactly where it stopped. Nothing is ever regenerated if it already exists.
+ *
+ * Visuals per scene:  AI image (image-provider chain) → optional AI image-to-video (video-
+ * provider chain, free-tier first, paid only if allowed, skipping any out of quota today)
+ * → otherwise the AI image is animated with camera motion. Stock footage is an opt-in last
+ * resort only when every AI image provider fails.
+ */
 
 export type StepOutcome = {
   state: "queued" | "waiting" | "done" | "failed";
@@ -28,7 +45,7 @@ export type StepOutcome = {
 };
 
 const WEIGHTS: Record<AgentJob["step"], [number, number]> = {
-  story: [0, 5], voice: [5, 20], clips: [20, 70], audio: [70, 71], segments: [71, 88], compose: [88, 97], validate: [97, 99], publish: [99, 100], done: [100, 100],
+  story: [0, 6], voice: [6, 20], clips: [20, 66], audio: [66, 67], segments: [67, 85], parts: [85, 93], compose: [93, 97], validate: [97, 99], publish: [99, 100], done: [100, 100],
 };
 const progressFor = (step: AgentJob["step"], fraction: number) => {
   const [from, to] = WEIGHTS[step];
@@ -36,14 +53,65 @@ const progressFor = (step: AgentJob["step"], fraction: number) => {
 };
 const backoffSeconds = (attempt: number) => Math.min(600, 20 * 2 ** Math.max(0, attempt - 1));
 const due = (asset: AssetRow | undefined) => !asset?.next_attempt_at || new Date(asset.next_attempt_at).getTime() <= Date.now();
+/** When every free provider is out of quota we wait and resume instead of failing. */
+const QUOTA_WAIT = 1800;
 
 type Ctx = { job: AgentJob; videoId: string; story: StoryPlan | null; settings: VideoSettings; config: AgentConfig; row: Record<string, unknown> };
+const isLong = (ctx: Ctx) => ctx.settings.format === "long";
+const aspectOf = (ctx: Ctx) => (isLong(ctx) ? "16:9" as const : "9:16" as const);
 
 /* ---------------- story ---------------- */
 
 async function storyStep(ctx: Ctx): Promise<StepOutcome> {
-  if (ctx.story?.scenes?.length) return { state: "queued", step: "voice", progress: progressFor("story", 1) };
+  if (storyComplete(ctx.story)) return { state: "queued", step: "voice", progress: progressFor("story", 1) };
   const niche = getNiche(String(ctx.row.niche));
+  const warnings = Array.isArray(ctx.row.warnings) ? (ctx.row.warnings as string[]) : [];
+
+  const scriptMode = Boolean(ctx.settings.script);
+  if (isLong(ctx) || scriptMode) {
+    if (!scriptMode && !canWriteLong(niche.id)) return { state: "failed", step: "story", error: `Long videos need a story model. Add a free key (GROQ_API_KEY, GEMINI_API_KEY, CEREBRAS_API_KEY…)${niche.fiction === "never" ? " — factual niches need a keyed model" : ""}.` };
+    const tries = await getAssets(ctx.videoId, "story");
+    const partIndex = ctx.story?.parts?.find((part) => !part.done)?.index ?? -1;
+    const slot = partIndex + 1; // 0 = outline, n = part n-1
+    const record = tries.find((asset) => asset.scene_index === slot);
+    if (record && !due(record)) return { state: "waiting", step: "story", delaySeconds: Math.max(5, Math.ceil((new Date(record.next_attempt_at!).getTime() - Date.now()) / 1000)) };
+    try {
+      if (!ctx.story && scriptMode) {
+        await logJob(ctx.job.id, "info", "Script mode: reading your script (your words are kept exactly) and planning the visuals…");
+        const plan = await outlineFromScript({ niche: niche.id, script: ctx.settings.script!, style: ctx.settings.style, format: ctx.settings.format, timezone: ctx.config.timezone });
+        await updateVideo(ctx.videoId, { story: plan, title: plan.title, hook: plan.hook, sub_niche: plan.subNiche || null });
+        await upsertAsset(ctx.videoId, 0, "story", { status: "done", attempts: 0, error: null, next_attempt_at: null });
+        await logJob(ctx.job.id, "info", `Storyboard plan ready: “${plan.title}” — ${plan.parts?.length} part(s), ${plan.characters.length} characters (${plan.model ?? "built-in planner"}).`);
+        return { state: "queued", step: "story", progress: progressFor("story", 0.15) };
+      }
+      if (!ctx.story) {
+        await logJob(ctx.job.id, "info", `Planning a ${Math.round(ctx.settings.targetDuration / 60)}-minute ${niche.label} video in parts…`);
+        const plan = await generateLongOutline({ niche: niche.id, subNiche: (ctx.row.sub_niche as string) ?? undefined, idea: ctx.settings.idea, targetDuration: ctx.settings.targetDuration, style: ctx.settings.style, timezone: ctx.config.timezone, voiceGender: ctx.settings.voiceGender, avoidTitles: await recentTitles(20) });
+        await updateVideo(ctx.videoId, { story: plan, title: plan.title, hook: plan.hook, sub_niche: plan.subNiche || null });
+        await upsertAsset(ctx.videoId, 0, "story", { status: "done", attempts: 0, error: null, next_attempt_at: null });
+        await logJob(ctx.job.id, "info", `Outline ready: “${plan.title}” — ${plan.parts?.length} parts, ${plan.characters.length} characters, ${plan.locations?.length ?? 0} locations (${plan.model}).`);
+        return { state: "queued", step: "story", progress: progressFor("story", 0.15) };
+      }
+      const next = scriptMode ? await writeScriptPart(ctx.story, ctx.settings.style) : await generateNextPart(ctx.story, { style: ctx.settings.style });
+      const done = next.parts?.filter((part) => part.done).length ?? 0;
+      const total = next.parts?.length ?? 1;
+      await updateVideo(ctx.videoId, { story: next });
+      await upsertAsset(ctx.videoId, slot, "story", { status: "done", attempts: 0, error: null, next_attempt_at: null });
+      await logJob(ctx.job.id, "info", `Part ${partIndex + 1}/${total} written (${next.scenes.length} scenes so far).`);
+      return storyComplete(next)
+        ? { state: "queued", step: "voice", progress: progressFor("story", 1) }
+        : { state: "queued", step: "story", progress: progressFor("story", 0.15 + 0.85 * (done / total)) };
+    } catch (error) {
+      // Never restart: keep what's written, retry only this part (the model chain moves on to the next provider).
+      const attempts = (record?.attempts ?? 0) + 1;
+      const wait = attempts >= ctx.config.maxAttemptsPerScene ? QUOTA_WAIT : backoffSeconds(attempts) * 3;
+      const message = error instanceof Error ? error.message : String(error);
+      await upsertAsset(ctx.videoId, slot, "story", { status: "failed", attempts: attempts >= ctx.config.maxAttemptsPerScene ? 0 : attempts, error: message, next_attempt_at: new Date(Date.now() + wait * 1000) });
+      await logJob(ctx.job.id, "warn", `${slot === 0 ? "Outline" : `Part ${slot}`} not written yet (${message}). Saved progress is kept; retrying in ${Math.round(wait / 60) || 1} min.`);
+      return { state: "waiting", step: "story", delaySeconds: wait, error: wait === QUOTA_WAIT ? `${FREE_UNAVAILABLE_MESSAGE} Paused — resumes automatically when a free story model is available.` : null };
+    }
+  }
+
   await logJob(ctx.job.id, "info", `Writing ${niche.label} story (${ctx.settings.targetDuration}s)…`);
   const { plan, note } = await generateStoryPlan({
     niche: niche.id,
@@ -56,13 +124,13 @@ async function storyStep(ctx: Ctx): Promise<StepOutcome> {
     voiceGender: ctx.settings.voiceGender,
     avoidTitles: await recentTitles(20),
   });
-  const warnings = Array.isArray(ctx.row.warnings) ? (ctx.row.warnings as string[]) : [];
+  plan.format = "short";
   await updateVideo(ctx.videoId, { story: plan, title: plan.title, hook: plan.hook, sub_niche: plan.subNiche || null, warnings: note ? [...warnings, note] : warnings });
   await logJob(ctx.job.id, note ? "warn" : "info", note ?? `Story ready: “${plan.title}” — ${plan.scenes.length} scenes (${plan.source === "ai" ? plan.model : "template writer"}).`);
   return { state: "queued", step: "voice", progress: progressFor("story", 1) };
 }
 
-/* ---------------- clips ---------------- */
+/* ---------------- visuals ---------------- */
 
 async function saveClip(ctx: Ctx, index: number, provider: VideoProvider, bytes: Buffer, mimeType: string, attempts: number) {
   const ext = mimeType.includes("webm") ? "webm" : mimeType.includes("quicktime") ? "mov" : "mp4";
@@ -74,155 +142,192 @@ async function saveClip(ctx: Ctx, index: number, provider: VideoProvider, bytes:
   await putFile(key, file);
   const cost = estimateCost(provider.id, info.duration, ctx.config);
   await recordUsage(provider.id, info.duration, cost);
+  await markCall(`video-${provider.id}`);
   await upsertAsset(ctx.videoId, index, "clip", { status: "done", mode: "video", provider: provider.id, path: key, provider_ref: null, error: null, attempts, meta: { duration: info.duration, width: info.width, height: info.height, cost } });
-  await logJob(ctx.job.id, "info", `Scene ${index + 1}: ${info.duration.toFixed(1)}s AI video clip from ${provider.label}${cost != null ? ` (~$${cost})` : ""}.`);
+  await logJob(ctx.job.id, "info", `Scene ${index + 1}: ${info.duration.toFixed(1)}s AI video from ${provider.label}${cost != null ? ` (~$${cost})` : ""}.`);
 }
 
-async function failAsset(ctx: Ctx, index: number, kind: "clip" | "keyframe", attempts: number, error: unknown): Promise<StepOutcome> {
-  const message = error instanceof Error ? error.message : String(error);
-  const retryable = error instanceof ProviderError ? error.retryable : true;
-  const exhausted = attempts >= ctx.config.maxAttemptsPerScene;
-  if (retryable && !exhausted) {
-    const wait = backoffSeconds(attempts);
-    await upsertAsset(ctx.videoId, index, kind, { status: "failed", attempts, error: message, provider_ref: null, next_attempt_at: new Date(Date.now() + wait * 1000) });
-    await logJob(ctx.job.id, "warn", `Scene ${index + 1} ${kind} attempt ${attempts} failed: ${message}. Retrying in ${wait}s.`);
-    return { state: "waiting", step: "clips", delaySeconds: wait, currentScene: index };
-  }
-  await upsertAsset(ctx.videoId, index, kind, { status: "failed", attempts, error: message, provider_ref: null, next_attempt_at: null });
-  const reason = `Scene ${index + 1} failed after ${attempts} attempt(s): ${message}`;
-  await logJob(ctx.job.id, "error", reason);
-  return { state: "failed", step: "clips", error: reason, currentScene: index };
+/** Uses the scene's AI image with camera motion (no extra generation needed). */
+async function useImageMotion(ctx: Ctx, index: number, keyframe: AssetRow, reason: string) {
+  await upsertAsset(ctx.videoId, index, "clip", { status: "done", mode: "image", provider: keyframe.provider ?? "ai-image", path: keyframe.path, provider_ref: null, error: null, next_attempt_at: null, meta: { from: "keyframe", reason } });
+}
+
+async function stockForScene(ctx: Ctx, scene: PlanScene, clips: Map<number, AssetRow>, attempts: number): Promise<StepOutcome> {
+  const i = scene.index;
+  const avoid = new Set([...clips.values()].map((clip) => String(clip.meta?.stockId ?? "")).filter(Boolean));
+  const stock = await stockClipFor(scene, ctx.story!, { seed: i * 31 + ctx.story!.title.length, avoid });
+  const file = path.join(await ensureScratch(ctx.videoId), `clip-${i}.mp4`);
+  await writeFile(file, stock.bytes);
+  const info = await probe(file).catch(() => null);
+  if (!info?.hasVideo || info.duration < 0.5) throw new ProviderError("Stock file is not a playable video.", true);
+  const key = storageKey.clip(ctx.videoId, i, "mp4");
+  await putFile(key, file);
+  await upsertAsset(ctx.videoId, i, "clip", { status: "done", mode: "stock", provider: stock.source, path: key, error: null, attempts, next_attempt_at: null, meta: { duration: info.duration, stockId: stock.stockId, credit: stock.credit, pageUrl: stock.pageUrl, query: stock.query } });
+  await logJob(ctx.job.id, "warn", `Scene ${i + 1}: every AI image provider failed, used STOCK VIDEO “${stock.query}” (${stock.source}, by ${stock.credit}) — labelled as stock.`);
+  return { state: "queued", step: "clips", currentScene: i };
+}
+
+function wantsAiVideo(ctx: Ctx, scene: PlanScene) {
+  if (ctx.config.aiVideoScenes === "none") return false;
+  if (ctx.config.aiVideoScenes === "hook") return scene.index === 0;
+  return true;
 }
 
 async function clipsStep(ctx: Ctx): Promise<StepOutcome> {
   const story = ctx.story!;
-  const provider = resolveProvider(ctx.settings, ctx.config);
-  const imageMode = !provider && ctx.settings.allowImageMode && ctx.config.allowImageMode;
-  if (!provider && !imageMode) {
-    return { state: "failed", step: "clips", error: "Video provider not configured." + (ctx.settings.allowImageMode && !ctx.config.allowImageMode ? " (IMAGE MODE is also disabled in Agent settings.)" : "") };
-  }
-  await updateVideo(ctx.videoId, { provider: provider ? provider.id : "pollinations-image" });
+  const total = story.scenes.length;
+  const aspect = aspectOf(ctx);
+  const chain = videoProviderChain(ctx.settings, ctx.config);
   const clips = new Map((await getAssets(ctx.videoId, "clip")).map((asset) => [asset.scene_index, asset]));
   const keyframes = new Map((await getAssets(ctx.videoId, "keyframe")).map((asset) => [asset.scene_index, asset]));
-  const total = story.scenes.length;
   const doneCount = story.scenes.filter((scene) => clips.get(scene.index)?.status === "done").length;
+  const progress = (extra = 0) => progressFor("clips", (doneCount + extra) / total);
   let earliestRetry: number | null = null;
+  const later = (asset: AssetRow) => { const at = new Date(asset.next_attempt_at!).getTime(); earliestRetry = earliestRetry == null ? at : Math.min(earliestRetry, at); };
 
   for (const scene of story.scenes) {
     const i = scene.index;
-    const asset = clips.get(i);
-    if (asset?.status === "done" && (await storedLooksPresent(asset.path))) continue;
-    const kidsSafe = ctx.settings.audience === "kids";
-    const prompts = scenePrompt(story, scene, ctx.settings.style, kidsSafe);
-    const attempts = (asset?.attempts ?? 0) + 1;
+    const clip = clips.get(i);
+    if (clip?.status === "done" && (await storedLooksPresent(clip.path))) continue;
+    const prompts = scenePrompt(story, scene, ctx.settings.style, ctx.settings.audience === "kids");
 
-    // Poll an in-flight async generation.
-    if (asset?.status === "running" && asset.provider_ref && provider?.poll) {
-      try {
-        const poll = await provider.poll(asset.provider_ref, ctx.config);
-        if (poll.status === "pending") return { state: "waiting", step: "clips", delaySeconds: 12, currentScene: i, progress: progressFor("clips", doneCount / total) };
-        if (poll.status === "failed") return failAsset(ctx, i, "clip", asset.attempts, new ProviderError(poll.error, poll.retryable));
-        await saveClip(ctx, i, provider, poll.result.bytes, poll.result.mimeType, asset.attempts);
-        return { state: "queued", step: "clips", currentScene: i, progress: progressFor("clips", (doneCount + 1) / total) };
-      } catch (error) { return failAsset(ctx, i, "clip", asset.attempts, error); }
-    }
-    if (asset?.status === "failed" && asset.attempts >= ctx.config.maxAttemptsPerScene) {
-      return { state: "failed", step: "clips", currentScene: i, error: `Scene ${i + 1} failed after ${asset.attempts} attempt(s): ${asset.error ?? "unknown error"}` };
-    }
-    if (!due(asset)) {
-      const at = new Date(asset!.next_attempt_at!).getTime();
-      earliestRetry = earliestRetry == null ? at : Math.min(earliestRetry, at);
-      continue;
-    }
-
-    // Cost control: daily cap on generations.
-    const usage = await usageToday();
-    if (usage.clips >= ctx.config.dailyClipLimit) {
-      await logJob(ctx.job.id, "warn", `Daily clip limit (${ctx.config.dailyClipLimit}) reached — paused. Raise it in Agent settings or wait until tomorrow.`);
-      return { state: "waiting", step: "clips", delaySeconds: 3600, currentScene: i, error: "Paused: daily clip limit reached.", progress: progressFor("clips", doneCount / total) };
-    }
-
-    // IMAGE MODE (explicit opt-in only): a still per scene, animated later with camera motion.
-    if (imageMode) {
-      try {
-        await upsertAsset(ctx.videoId, i, "clip", { status: "running", mode: "image", provider: "pollinations-image", attempts });
-        const image = await pollinationsImage(prompts.keyframePrompt, prompts.seed + i, ctx.config);
-        const key = storageKey.clip(ctx.videoId, i, "jpg");
-        const file = path.join(await ensureScratch(ctx.videoId), `clip-${i}.jpg`);
-        await writeFile(file, image.bytes);
-        await putFile(key, file);
-        await recordUsage("pollinations-image", 0, null);
-        await upsertAsset(ctx.videoId, i, "clip", { status: "done", mode: "image", provider: "pollinations-image", path: key, error: null, attempts });
-        await logJob(ctx.job.id, "info", `Scene ${i + 1}: IMAGE MODE still generated (not AI video).`);
-        return { state: "queued", step: "clips", currentScene: i, progress: progressFor("clips", (doneCount + 1) / total) };
-      } catch (error) { return failAsset(ctx, i, "clip", attempts, error); }
-    }
-
-    const videoProvider = provider!;
-    // Character consistency: keyframe from a fixed character seed, then image-to-video (where supported).
-    let imageDataUrl: string | undefined;
-    const wantsKeyframe = ctx.settings.consistency && videoProvider.capabilities.imageToVideo && scene.characters.length > 0;
-    if (wantsKeyframe) {
+    // 0) An AI clip already submitted: poll it (the provider is remembered on the asset).
+    if (clip?.status === "running" && clip.provider_ref && clip.provider) {
+      const provider = getProvider(clip.provider);
       const keyframe = keyframes.get(i);
-      if (keyframe?.status === "done" && keyframe.path && (await storedLooksPresent(keyframe.path))) {
-        imageDataUrl = `data:image/jpeg;base64,${(await readFile(await materialize(keyframe.path, ctx.videoId))).toString("base64")}`;
-      } else if (!keyframe || keyframe.status !== "failed" || keyframe.attempts < ctx.config.maxAttemptsPerScene) {
-        const kfAttempts = (keyframe?.attempts ?? 0) + 1;
-        try {
-          const image = await pollinationsImage(prompts.keyframePrompt, prompts.seed, ctx.config);
-          const key = storageKey.keyframe(ctx.videoId, i);
-          const file = path.join(await ensureScratch(ctx.videoId), `keyframe-${i}.jpg`);
-          await writeFile(file, image.bytes);
-          await putFile(key, file);
-          await upsertAsset(ctx.videoId, i, "keyframe", { status: "done", mode: "image", provider: "pollinations-image", path: key, attempts: kfAttempts, error: null });
-          await logJob(ctx.job.id, "info", `Scene ${i + 1}: character keyframe ready (seed ${prompts.seed}).`);
-          return { state: "queued", step: "clips", currentScene: i, progress: progressFor("clips", doneCount / total) };
-        } catch (error) {
-          await upsertAsset(ctx.videoId, i, "keyframe", { status: "failed", attempts: kfAttempts, error: error instanceof Error ? error.message : String(error) });
-          await logJob(ctx.job.id, "warn", `Scene ${i + 1}: keyframe failed, falling back to text-to-video.`);
-        }
+      if (!provider?.poll) { if (keyframe?.path) await useImageMotion(ctx, i, keyframe, "provider unavailable"); continue; }
+      const access = accessFor(provider, ctx.config);
+      if (!access.allowed) {
+        // e.g. Free Mode switched on while a paid clip was in flight: never call it again.
+        await logJob(ctx.job.id, "warn", `Scene ${i + 1}: ${provider.label} — ${access.reason}. No call made; using the AI image with camera motion.`);
+        if (keyframe?.path) await useImageMotion(ctx, i, keyframe, access.reason);
+        continue;
+      }
+      try {
+        const poll = await provider.poll(clip.provider_ref, ctx.config);
+        if (poll.status === "pending") return { state: "waiting", step: "clips", delaySeconds: 12, currentScene: i, progress: progress() };
+        if (poll.status === "done") { await saveClip(ctx, i, provider, poll.result.bytes, poll.result.mimeType, clip.attempts); return { state: "queued", step: "clips", currentScene: i, progress: progress(1) }; }
+        await logJob(ctx.job.id, "warn", `Scene ${i + 1}: ${provider.label} failed (${poll.error}). Using the AI image with camera motion.`);
+        if (keyframe?.path) await useImageMotion(ctx, i, keyframe, poll.error);
+        return { state: "queued", step: "clips", currentScene: i, progress: progress(1) };
+      } catch (error) {
+        if (keyframe?.path) await useImageMotion(ctx, i, keyframe, error instanceof Error ? error.message : "poll failed");
+        return { state: "queued", step: "clips", currentScene: i, progress: progress(1) };
       }
     }
+    if (clip && !due(clip)) { later(clip); continue; }
 
+    // 1) The scene's AI image — the base of every scene (and the first frame for image-to-video).
+    let keyframe = keyframes.get(i);
+    if (!(keyframe?.status === "done" && keyframe.path && (await storedLooksPresent(keyframe.path)))) {
+      if (keyframe && !due(keyframe)) { later(keyframe); continue; }
+      const attempts = (keyframe?.attempts ?? 0) + 1;
+      try {
+        await upsertAsset(ctx.videoId, i, "keyframe", { status: "running", mode: "image", attempts });
+        const image = await generateImage(prompts.keyframePrompt, prompts.seed + i, ctx.config, aspect);
+        const key = storageKey.keyframe(ctx.videoId, i);
+        const file = path.join(await ensureScratch(ctx.videoId), `keyframe-${i}.jpg`);
+        await writeFile(file, image.bytes);
+        await putFile(key, file);
+        await upsertAsset(ctx.videoId, i, "keyframe", { status: "done", mode: "image", provider: image.provider, path: key, attempts, error: null, next_attempt_at: null });
+        await logJob(ctx.job.id, "info", `Scene ${i + 1}/${total}: AI image ready (${image.provider}).`);
+        return { state: "queued", step: "clips", currentScene: i, progress: progress(0.5) };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const quota = error instanceof ImageQuotaError;
+        if ((quota || attempts >= ctx.config.maxAttemptsPerScene) && ctx.config.allowStockVideo && stockConfigured()) {
+          try { return await stockForScene(ctx, scene, clips, attempts); } catch { /* fall through to waiting */ }
+        }
+        const wait = quota || attempts >= ctx.config.maxAttemptsPerScene ? QUOTA_WAIT : backoffSeconds(attempts);
+        await upsertAsset(ctx.videoId, i, "keyframe", { status: "failed", attempts: wait === QUOTA_WAIT ? 0 : attempts, error: message, next_attempt_at: new Date(Date.now() + wait * 1000) });
+        await logJob(ctx.job.id, "warn", quota
+          ? `Scene ${i + 1}: ${FREE_UNAVAILABLE_MESSAGE} Every free image provider is out of quota right now; everything made so far is saved — resuming automatically in ${Math.round(wait / 60)} min.`
+          : `Scene ${i + 1} image attempt ${attempts} failed: ${message}. Retrying in ${wait >= 60 ? `${Math.round(wait / 60)} min` : `${wait}s`}.`);
+        return { state: "waiting", step: "clips", delaySeconds: wait, currentScene: i, progress: progress(), error: quota || wait === QUOTA_WAIT ? `${FREE_UNAVAILABLE_MESSAGE} Paused — resumes automatically when free quota returns.` : null };
+      }
+    }
+    keyframe = keyframes.get(i) ?? (await getAssets(ctx.videoId, "keyframe")).find((asset) => asset.scene_index === i);
+    if (!keyframe?.path) continue;
+
+    // 2) Optional AI image-to-video, provider by provider, skipping any out of quota today.
+    const aiAllowed = chain.length > 0 && wantsAiVideo(ctx, scene) && clip?.mode !== "image";
+    let provider: VideoProvider | undefined;
+    if (aiAllowed && (await usageToday()).clips < ctx.config.dailyClipLimit) {
+      for (const candidate of chain) if (!(await isExhausted(`video-${candidate.id}`))) { provider = candidate; break; }
+    }
+    if (!provider) {
+      await useImageMotion(ctx, i, keyframe, chain.length ? "AI video providers out of quota / daily clip limit" : "no AI video provider");
+      continue; // no generation needed — move straight on to the next scene
+    }
+    const attempts = (clip?.attempts ?? 0) + 1;
+    if (!accessFor(provider, ctx.config).allowed) { await useImageMotion(ctx, i, keyframe, "provider not allowed"); continue; }
     try {
-      await upsertAsset(ctx.videoId, i, "clip", { status: "running", mode: "video", provider: videoProvider.id, attempts, error: null, next_attempt_at: null });
-      await logJob(ctx.job.id, "info", `Scene ${i + 1}/${total}: generating ${imageDataUrl ? "image-to-video" : "text-to-video"} clip with ${videoProvider.label} (attempt ${attempts})…`);
-      const submission = await videoProvider.submit({
+      const imageDataUrl = provider.capabilities.imageToVideo ? `data:image/jpeg;base64,${(await readFile(await materialize(keyframe.path, ctx.videoId))).toString("base64")}` : undefined;
+      const imageUrl = provider.capabilities.imageToVideo && storageBackend() === "supabase" ? (await signedUrl(keyframe.path, 3600)) ?? undefined : undefined;
+      await upsertAsset(ctx.videoId, i, "clip", { status: "running", mode: "video", provider: provider.id, attempts, error: null, next_attempt_at: null });
+      await logJob(ctx.job.id, "info", `Scene ${i + 1}/${total}: animating the AI image with ${provider.label} (attempt ${attempts})…`);
+      const submission = await provider.submit({
         prompt: prompts.prompt,
         negativePrompt: prompts.negativePrompt,
         durationSec: Math.min(ctx.config.maxClipSeconds, scene.duration > 6 && ctx.settings.quality === "production" ? 10 : 5),
-        aspectRatio: "9:16",
+        aspectRatio: aspect,
         seed: prompts.seed,
         imageDataUrl,
+        imageUrl,
         quality: ctx.settings.quality,
       }, ctx.config);
       if (submission.status === "pending") {
-        await upsertAsset(ctx.videoId, i, "clip", { status: "running", provider_ref: submission.ref });
-        return { state: "waiting", step: "clips", delaySeconds: 15, currentScene: i, progress: progressFor("clips", doneCount / total) };
+        await upsertAsset(ctx.videoId, i, "clip", { status: "running", provider: provider.id, provider_ref: submission.ref });
+        return { state: "waiting", step: "clips", delaySeconds: 15, currentScene: i, progress: progress(0.5) };
       }
-      await saveClip(ctx, i, videoProvider, submission.result.bytes, submission.result.mimeType, attempts);
-      return { state: "queued", step: "clips", currentScene: i, progress: progressFor("clips", (doneCount + 1) / total) };
+      await saveClip(ctx, i, provider, submission.result.bytes, submission.result.mimeType, attempts);
+      return { state: "queued", step: "clips", currentScene: i, progress: progress(1) };
     } catch (error) {
-      return failAsset(ctx, i, "clip", attempts, error);
+      const status = error instanceof ProviderError ? error.status : undefined;
+      const retryable = error instanceof ProviderError ? error.retryable : true;
+      const message = error instanceof Error ? error.message : String(error);
+      if (status === 401 || status === 402 || status === 403 || status === 429) {
+        // Out of credits / quota / key refused → skip this provider for the rest of the day, try the next one.
+        await markFailure(`video-${provider.id}`, true);
+        await upsertAsset(ctx.videoId, i, "clip", { status: "pending", attempts: 0, error: message, provider_ref: null, next_attempt_at: null });
+        await logJob(ctx.job.id, "warn", `Scene ${i + 1}: ${provider.label} is out of quota/credits (${status}) — switching provider.`);
+        return { state: "queued", step: "clips", currentScene: i, progress: progress() };
+      }
+      if (retryable && attempts < ctx.config.maxAttemptsPerScene) {
+        const wait = backoffSeconds(attempts);
+        await upsertAsset(ctx.videoId, i, "clip", { status: "failed", attempts, error: message, provider_ref: null, next_attempt_at: new Date(Date.now() + wait * 1000) });
+        await logJob(ctx.job.id, "warn", `Scene ${i + 1}: ${provider.label} attempt ${attempts} failed (${message}). Retrying in ${wait}s.`);
+        return { state: "waiting", step: "clips", delaySeconds: wait, currentScene: i, progress: progress() };
+      }
+      await markFailure(`video-${provider.id}`);
+      await logJob(ctx.job.id, "warn", `Scene ${i + 1}: ${provider.label} failed (${message}). Using the AI image with camera motion.`);
+      await useImageMotion(ctx, i, keyframe, message);
+      return { state: "queued", step: "clips", currentScene: i, progress: progress(1) };
     }
   }
-  if (earliestRetry != null) return { state: "waiting", step: "clips", delaySeconds: Math.max(5, Math.ceil((earliestRetry - Date.now()) / 1000)), progress: progressFor("clips", doneCount / total) };
+  if (earliestRetry != null) return { state: "waiting", step: "clips", delaySeconds: Math.max(5, Math.ceil((earliestRetry - Date.now()) / 1000)), progress: progress() };
   return { state: "queued", step: "audio", progress: progressFor("clips", 1), currentScene: null };
 }
 
-/* ---------------- audio + compose + validate ---------------- */
+/* ---------------- editing: timeline, segments, parts, final ---------------- */
 
 async function audioStep(): Promise<StepOutcome> {
   if (!(await ffmpegAvailable())) return { state: "failed", step: "audio", error: "ffmpeg is not available on this server. On Vercel, make sure the ffmpeg-static package is installed; elsewhere install ffmpeg." };
   return { state: "queued", step: "segments", progress: progressFor("audio", 1) };
 }
 
-/** Scene list + timeline, shared by the segments and compose steps so both agree on lengths. */
+type PlannedScene = ComposeScene & { clipKey: string; clipStamp: string; voiceKey: string | null; clipMode: string | null };
+type Group = { index: number; scenes: PlannedScene[]; entries: TimelineEntry[]; maxDuration: number };
+
+/**
+ * Timeline for the whole video. Shorts are one group; long videos get one group per story part
+ * (each part is edited and rendered on its own, then the parts are joined).
+ */
 async function composePlan(ctx: Ctx) {
   const story = ctx.story!;
   const clips = new Map((await getAssets(ctx.videoId, "clip")).map((asset) => [asset.scene_index, asset]));
   const voices = new Map((await getAssets(ctx.videoId, "voice")).map((asset) => [asset.scene_index, asset]));
-  const scenes: (ComposeScene & { clipKey: string; clipStamp: string; voiceKey: string | null })[] = [];
+  const scenes: PlannedScene[] = [];
   for (const scene of story.scenes) {
     const clip = clips.get(scene.index);
     if (!clip?.path || clip.status !== "done") return null;
@@ -244,89 +349,171 @@ async function composePlan(ctx: Ctx) {
       clipKey: clip.path,
       clipStamp: `${clip.path}|${new Date(clip.updated_at).getTime()}`,
       voiceKey: voiceOk ? voice!.path : null,
+      clipMode: clip.mode,
     });
   }
-  const maxDuration = Math.max(ctx.settings.targetDuration + 10, 20);
-  return { scenes, clips, timeline: planTimeline(scenes, maxDuration), maxDuration };
+  const groups: Group[] = [];
+  if (isLong(ctx)) {
+    const byPart = new Map<number, PlannedScene[]>();
+    story.scenes.forEach((scene, k) => {
+      const key = scene.part ?? Math.floor(k / 8);
+      byPart.set(key, [...(byPart.get(key) ?? []), scenes[k]]);
+    });
+    [...byPart.entries()].sort((a, b) => a[0] - b[0]).forEach(([, list], index) => {
+      const maxDuration = 60 * 20;
+      groups.push({ index, scenes: list, entries: planTimeline(list, maxDuration).entries, maxDuration });
+    });
+  } else {
+    const maxDuration = Math.max(ctx.settings.targetDuration + 10, 20);
+    groups.push({ index: 0, scenes, entries: planTimeline(scenes, maxDuration).entries, maxDuration });
+  }
+  const lengthOf = new Map<number, number>();
+  for (const group of groups) group.scenes.forEach((scene, k) => lengthOf.set(scene.index, group.entries[k].length));
+  return { scenes, clips, groups, lengthOf };
 }
 
-/** One scene segment per call (fits a serverless request). Re-renders only when its clip, length or look changed. */
+/** One scene segment per call. Re-renders only when its clip, length, size or look changed. */
 async function segmentsStep(ctx: Ctx): Promise<StepOutcome> {
   const plan = await composePlan(ctx);
   if (!plan) return { state: "queued", step: "clips" };
   const niche = getNiche(ctx.story!.niche);
+  const dims = dimsFor(ctx.settings.format);
   const segments = new Map((await getAssets(ctx.videoId, "segment")).map((asset) => [asset.scene_index, asset]));
   const total = plan.scenes.length;
   for (const [i, scene] of plan.scenes.entries()) {
-    const length = plan.timeline.entries[i].length;
-    const signature = `${scene.clipStamp}|${length.toFixed(3)}|${niche.colorGrade}|${scene.camera}|${scene.atmosphere.join(",")}`;
+    const length = plan.lengthOf.get(scene.index)!;
+    const signature = `${scene.clipStamp}|${length.toFixed(3)}|${niche.colorGrade}|${scene.camera}|${scene.atmosphere.join(",")}|${dims.width}x${dims.height}`;
     const existing = segments.get(scene.index);
     if (existing?.status === "done" && existing.meta?.signature === signature && (await storedLooksPresent(existing.path))) continue;
-    await logJob(ctx.job.id, "info", `Rendering scene ${i + 1}/${total} (${length.toFixed(1)}s)…`);
+    await logJob(ctx.job.id, "info", `Editing scene ${i + 1}/${total} (${length.toFixed(1)}s, ${scene.kind === "image" ? `AI image + ${scene.camera} motion` : "AI video"})…`);
     const source = await materialize(scene.clipKey, ctx.videoId);
     const out = path.join(await ensureScratch(ctx.videoId), `seg-${scene.index}.mp4`);
-    await renderSceneSegment({ ...scene, source }, length, niche.colorGrade, out);
+    await renderSceneSegment({ ...scene, source }, length, niche.colorGrade, out, dims);
     const key = storageKey.segment(ctx.videoId, scene.index);
     await putFile(key, out);
     await upsertAsset(ctx.videoId, scene.index, "segment", { status: "done", mode: "video", path: key, error: null, meta: { signature, length } });
     return { state: "queued", step: "segments", currentScene: scene.index, progress: progressFor("segments", (i + 1) / total) };
   }
-  return { state: "queued", step: "compose", progress: progressFor("segments", 1), currentScene: null };
+  return { state: "queued", step: isLong(ctx) ? "parts" : "compose", progress: progressFor("segments", 1), currentScene: null };
 }
 
-/** Final pass: transitions, captions, audio mix, encode, cover, validation — then upload. */
-async function composeStep(ctx: Ctx): Promise<StepOutcome> {
+async function renderGroup(ctx: Ctx, group: Group, outFile: string, coverFile: string, partMode: boolean) {
   const story = ctx.story!;
   const niche = getNiche(story.niche);
-  const plan = await composePlan(ctx);
-  if (!plan) return { state: "queued", step: "clips" };
   const segmentAssets = new Map((await getAssets(ctx.videoId, "segment")).map((asset) => [asset.scene_index, asset]));
-  const scratch = await ensureScratch(ctx.videoId);
   const segments: string[] = [];
-  for (const scene of plan.scenes) {
+  for (const scene of group.scenes) {
     const asset = segmentAssets.get(scene.index);
-    if (!asset?.path || asset.status !== "done") return { state: "queued", step: "segments" };
+    if (!asset?.path || asset.status !== "done") return null;
     segments.push(await materialize(asset.path, ctx.videoId));
   }
   const scenes: ComposeScene[] = [];
-  for (const scene of plan.scenes) scenes.push({ ...scene, voiceFile: scene.voiceKey ? await materialize(scene.voiceKey, ctx.videoId) : null });
-  await logJob(ctx.job.id, "info", "Final mix: transitions, captions, voice, music and SFX…");
-  const workDir = path.join(scratch, "final");
-  const outFile = path.join(scratch, "final.mp4");
-  const coverFile = path.join(scratch, "cover.jpg");
-  const { mkdir } = await import("node:fs/promises");
+  for (const scene of group.scenes) scenes.push({ ...scene, voiceFile: scene.voiceKey ? await materialize(scene.voiceKey, ctx.videoId) : null });
+  const workDir = path.join(await ensureScratch(ctx.videoId), partMode ? `part-${group.index}` : "final");
   await mkdir(workDir, { recursive: true });
-  const result = await composeFinal({
+  return composeFinal({
     workDir, scenes, segments,
     grade: niche.colorGrade,
     ambience: ctx.settings.sfx ? niche.ambience : [],
     captions: ctx.settings.captions,
     captionsEnabled: true,
-    hookText: story.scenes[0]?.onScreenText || "",
+    hookText: group.index === 0 ? story.scenes[0]?.onScreenText || "" : "",
     coverTitle: story.seo.title || story.title,
     musicMood: ctx.settings.music ? story.musicMood : null,
     musicVolume: ctx.settings.musicVolume,
     sfxEnabled: ctx.settings.sfx,
     quality: ctx.settings.quality,
-    maxDuration: plan.maxDuration,
+    maxDuration: group.maxDuration,
     outFile, coverFile,
-    onProgress: async (label) => { await extendLease(ctx.job.id, 330); await logJob(ctx.job.id, "info", label); },
+    dims: dimsFor(ctx.settings.format),
+    partMode,
+    onProgress: async (label) => { await extendLease(ctx.job.id, 330); await logJob(ctx.job.id, "info", `${partMode ? `Part ${group.index + 1}: ` : ""}${label}`); },
   });
-  const report = await validateFinal(outFile, { maxDuration: ctx.settings.targetDuration + 10, expectAudio: scenes.some((scene) => scene.voiceFile) });
+}
+
+/** Long videos: edit each story part (transitions, captions, voice, SFX) as its own file. */
+async function partsStep(ctx: Ctx): Promise<StepOutcome> {
+  const plan = await composePlan(ctx);
+  if (!plan) return { state: "queued", step: "clips" };
+  const parts = new Map((await getAssets(ctx.videoId, "part")).map((asset) => [asset.scene_index, asset]));
+  const segmentAssets = new Map((await getAssets(ctx.videoId, "segment")).map((asset) => [asset.scene_index, asset]));
+  for (const group of plan.groups) {
+    const signature = group.scenes.map((scene) => `${scene.index}:${segmentAssets.get(scene.index)?.meta?.signature ?? ""}:${scene.voiceKey ?? ""}`).join("|");
+    const existing = parts.get(group.index);
+    if (existing?.status === "done" && existing.meta?.signature === signature && (await storedLooksPresent(existing.path))) continue;
+    const scratch = await ensureScratch(ctx.videoId);
+    const outFile = path.join(scratch, `part-${group.index}.mp4`);
+    const coverFile = group.index === 0 ? path.join(scratch, "cover.jpg") : "";
+    const result = await renderGroup(ctx, group, outFile, coverFile, true);
+    if (!result) return { state: "queued", step: "segments" };
+    await putFile(storageKey.part(ctx.videoId, group.index), outFile);
+    if (coverFile && (await fileExists(coverFile))) { await putFile(storageKey.cover(ctx.videoId), coverFile); await updateVideo(ctx.videoId, { cover_path: storageKey.cover(ctx.videoId) }); }
+    await upsertAsset(ctx.videoId, group.index, "part", { status: "done", mode: "video", path: storageKey.part(ctx.videoId, group.index), error: null, meta: { signature, duration: result.duration, warnings: result.warnings } });
+    await logJob(ctx.job.id, "info", `Part ${group.index + 1}/${plan.groups.length} edited (${result.duration.toFixed(0)}s).`);
+    return { state: "queued", step: "parts", progress: progressFor("parts", (group.index + 1) / plan.groups.length) };
+  }
+  return { state: "queued", step: "compose", progress: progressFor("parts", 1) };
+}
+
+/** Final pass. Shorts: full edit in one go. Long: join parts + one music bed + loudness. Then validation. */
+async function composeStep(ctx: Ctx): Promise<StepOutcome> {
+  const story = ctx.story!;
+  const plan = await composePlan(ctx);
+  if (!plan) return { state: "queued", step: "clips" };
+  const scratch = await ensureScratch(ctx.videoId);
+  const outFile = path.join(scratch, "final.mp4");
+  const coverFile = path.join(scratch, "cover.jpg");
+  const dims = dimsFor(ctx.settings.format);
+  let duration: number;
+  let composeWarnings: string[] = [];
+  let hasCover = false;
+
+  if (isLong(ctx)) {
+    const partAssets = new Map((await getAssets(ctx.videoId, "part")).map((asset) => [asset.scene_index, asset]));
+    const files: string[] = [];
+    for (const group of plan.groups) {
+      const asset = partAssets.get(group.index);
+      if (!asset?.path || asset.status !== "done") return { state: "queued", step: "parts" };
+      files.push(await materialize(asset.path, ctx.videoId));
+      composeWarnings.push(...(Array.isArray(asset.meta?.warnings) ? (asset.meta!.warnings as string[]) : []));
+    }
+    await logJob(ctx.job.id, "info", `Joining ${files.length} parts, adding the music bed and mastering loudness…`);
+    const workDir = path.join(scratch, "final");
+    await mkdir(workDir, { recursive: true });
+    const result = await assembleParts({ workDir, parts: files, musicMood: ctx.settings.music ? story.musicMood : null, musicVolume: ctx.settings.musicVolume, outFile, onProgress: async (label) => { await extendLease(ctx.job.id, 330); await logJob(ctx.job.id, "info", label); } });
+    duration = result.duration;
+    hasCover = await storedLooksPresent(storageKey.cover(ctx.videoId));
+  } else {
+    await logJob(ctx.job.id, "info", "Final edit: transitions, captions, voice, music and SFX…");
+    const result = await renderGroup(ctx, plan.groups[0], outFile, coverFile, false);
+    if (!result) return { state: "queued", step: "segments" };
+    duration = result.duration;
+    composeWarnings = result.warnings;
+    hasCover = await fileExists(coverFile);
+    if (hasCover) await putFile(storageKey.cover(ctx.videoId), coverFile);
+  }
+
+  const maxDuration = isLong(ctx) ? ctx.settings.targetDuration * 1.6 + 60 : ctx.settings.targetDuration + 10;
+  const report = await validateFinal(outFile, { maxDuration, expectAudio: plan.scenes.some((scene) => scene.voiceKey), dims, format: ctx.settings.format });
   if (!report.ok) return { state: "failed", step: "compose", error: `Validation failed: ${report.errors.join(" ")}` };
   await putFile(storageKey.final(ctx.videoId), outFile);
-  const hasCover = await fileExists(coverFile);
-  if (hasCover) await putFile(storageKey.cover(ctx.videoId), coverFile);
-  const modes = new Set(scenes.map((scene) => scene.kind));
-  const renderMode = modes.size > 1 ? "mixed" : modes.has("image") ? "image" : "video";
-  const prior = (Array.isArray(ctx.row.warnings) ? (ctx.row.warnings as string[]) : []).filter((w) => !/^Narration sped up|No synthesized sound|Final length|Cover image failed|IMAGE MODE|Duration .* above|No narration/.test(w));
+
+  const modes = new Set(plan.scenes.map((scene) => (scene.clipMode === "stock" ? "stock" : scene.clipMode === "image" ? "image" : "video")));
+  const renderMode = modes.size > 1 ? "mixed" : modes.has("image") ? "image" : modes.has("stock") ? "stock" : "video";
+  const stockCredits = Array.from(new Set([...plan.clips.values()].filter((clip) => clip.mode === "stock").map((clip) => `${clip.meta?.credit ?? "unknown"} (${clip.provider === "pixabay" ? "Pixabay" : "Pexels"})`)));
+  const prior = (Array.isArray(ctx.row.warnings) ? (ctx.row.warnings as string[]) : []).filter((w) => !/^Narration sped up|No synthesized sound|Final length|Cover image failed|IMAGE MODE|AI IMAGES|STOCK VIDEO|Duration .* above|No narration/.test(w));
   const costs = [...plan.clips.values()].map((clip) => Number(clip.meta?.cost)).filter((n) => Number.isFinite(n));
+  const imageScenes = plan.scenes.filter((scene) => scene.clipMode === "image").length;
   await updateVideo(ctx.videoId, {
     final_path: storageKey.final(ctx.videoId),
     cover_path: hasCover ? storageKey.cover(ctx.videoId) : null,
-    duration_sec: Math.round(result.duration * 10) / 10,
+    duration_sec: Math.round(duration * 10) / 10,
     render_mode: renderMode,
-    warnings: Array.from(new Set([...prior, ...result.warnings, ...report.warnings, ...(renderMode !== "video" ? ["IMAGE MODE: some or all scenes are still images with camera motion, not AI video."] : [])])).slice(0, 20),
+    warnings: Array.from(new Set([
+      ...prior, ...composeWarnings, ...report.warnings,
+      ...(imageScenes ? [`AI IMAGES + MOTION: ${imageScenes}/${plan.scenes.length} scenes are AI-generated images animated with camera motion (not AI video clips).`] : []),
+      ...(modes.has("stock") ? [`STOCK VIDEO: some scenes are free stock footage, not AI. Credits: ${stockCredits.join(", ")}.`] : []),
+    ])).slice(0, 20),
     cost_estimate: costs.length ? Math.round(costs.reduce((sum, n) => sum + n, 0) * 100) / 100 : null,
   });
   await logJob(ctx.job.id, "info", `Validated: ${report.width}×${report.height}, ${report.duration.toFixed(1)}s, ${(report.sizeBytes / 1e6).toFixed(1)} MB.`);
@@ -356,13 +543,14 @@ export async function runStep(job: AgentJob): Promise<StepOutcome> {
   const settings = normalizeVideoSettings(row.settings);
   if (row.workflow !== "processing") await updateVideo(job.videoId, { workflow: "processing", error: null });
   const ctx: Ctx = { job, videoId: job.videoId, story: (row.story as StoryPlan) ?? null, settings, config, row };
-  if (job.step !== "story" && !ctx.story?.scenes?.length) return { state: "queued", step: "story" };
+  if (job.step !== "story" && !storyComplete(ctx.story)) return { state: "queued", step: "story" };
   switch (job.step) {
     case "story": return storyStep(ctx);
     case "voice": return generateVoiceStep(ctx.job, ctx.videoId, ctx.story!, settings, config, progressFor);
     case "clips": return clipsStep(ctx);
     case "audio": return audioStep();
     case "segments": return segmentsStep(ctx);
+    case "parts": return partsStep(ctx);
     case "compose": return composeStep(ctx);
     case "validate": return validateStep(ctx);
     case "publish": return publishStep(ctx);

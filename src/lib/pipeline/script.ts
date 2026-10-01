@@ -1,4 +1,5 @@
 import { NICHES, generateShort, type NicheId } from "@/lib/generator";
+import { primaryModel } from "@/lib/models";
 import { isExhausted, markCall, markFailure, looksLikeQuotaError } from "./usage";
 
 export interface VideoScript {
@@ -69,7 +70,7 @@ async function viaGroq(prompt: string): Promise<string> {
       Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
     },
     body: JSON.stringify({
-      model: "llama-3.3-70b-versatile",
+      model: primaryModel("groq"),
       messages: [{ role: "user", content: prompt }],
       temperature: 0.9,
       response_format: { type: "json_object" },
@@ -80,7 +81,7 @@ async function viaGroq(prompt: string): Promise<string> {
 }
 
 async function viaGemini(prompt: string): Promise<string> {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${process.env.GEMINI_API_KEY}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${primaryModel("gemini")}:generateContent?key=${process.env.GEMINI_API_KEY}`;
   const { status, text } = await fetchJson(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -102,7 +103,7 @@ async function viaOpenRouter(prompt: string): Promise<string> {
       "HTTP-Referer": process.env.APP_URL ?? "http://localhost:3000",
     },
     body: JSON.stringify({
-      model: "meta-llama/llama-3.3-70b-instruct:free",
+      model: primaryModel("openrouter"),
       messages: [{ role: "user", content: prompt }],
       temperature: 0.9,
     }),

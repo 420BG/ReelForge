@@ -83,6 +83,7 @@ export default function Editor({ id }: { id: string }) {
 
   if (missing) return <div className="py-20 text-center text-sm text-dim">Video not found. <Link href="/studio/videos" className="text-lime">Back to My Videos</Link></div>;
   if (!video || !settings) return <div className="flex justify-center py-20 text-dim"><Loader2 className="h-5 w-5 animate-spin" /></div>;
+  const long = settings.format === "long";
   const job = video.job;
   const assetsFor = (index: number) => (video.assets ?? []).filter((a) => a.sceneIndex === index);
   const needsRecompose = video.hasFinal && video.workflow !== "published";
@@ -99,9 +100,9 @@ export default function Editor({ id }: { id: string }) {
         <div className="space-y-3">
           <div className="relative overflow-hidden rounded-3xl border border-white/[0.08] bg-black">
             {video.hasFinal
-              ? <video key={video.updatedAt} controls playsInline preload="metadata" className="aspect-[9/16] w-full" poster={video.hasCover ? fileUrl(video.id, "cover", `&v=${encodeURIComponent(video.updatedAt)}`) : undefined} src={fileUrl(video.id, "final", `&v=${encodeURIComponent(video.updatedAt)}`)} />
+              ? <video key={video.updatedAt} controls playsInline preload="metadata" className={`${long ? "aspect-video" : "aspect-[9/16]"} w-full`} poster={video.hasCover ? fileUrl(video.id, "cover", `&v=${encodeURIComponent(video.updatedAt)}`) : undefined} src={fileUrl(video.id, "final", `&v=${encodeURIComponent(video.updatedAt)}`)} />
               : video.hasCover
-                ? <img src={fileUrl(video.id, "cover")} alt="" className="aspect-[9/16] w-full object-cover" />
+                ? <img src={fileUrl(video.id, "cover")} alt="" className={`${long ? "aspect-video" : "aspect-[9/16]"} w-full object-cover`} />
                 : <div className="grid aspect-[9/16] w-full place-items-center bg-gradient-to-b from-violet/20 to-void text-center text-sm text-dim"><div><Film className="mx-auto mb-2 h-8 w-8" />{running ? "Rendering…" : "Not rendered yet"}</div></div>}
           </div>
           {job && running && (
@@ -132,7 +133,7 @@ export default function Editor({ id }: { id: string }) {
         {/* script / scenes / settings */}
         <Panel className="min-w-0">
           <h1 className="font-display text-xl font-bold tracking-tight">{video.title || "Story pending…"}</h1>
-          <p className="mt-1 text-xs text-dim">{video.niche} · 9:16 · {formatDuration(video.durationSec ?? settings.targetDuration)} · {video.audience === "kids" ? "made for kids" : "not made for kids"}{video.story ? ` · story by ${video.story.source === "ai" ? "AI" : "template writer"}` : ""}</p>
+          <p className="mt-1 text-xs text-dim">{video.niche} · {long ? "Long 16:9" : "Short 9:16"} · {formatDuration(video.durationSec ?? settings.targetDuration)} · {video.audience === "kids" ? "made for kids" : "not made for kids"}{video.story ? ` · story by ${video.story.source === "ai" ? "AI" : "template writer"}` : ""}</p>
 
           {draft && draft.scenes.length > 0 && (
             <div className="-mx-1 mt-4 flex gap-2 overflow-x-auto px-1 pb-2">
@@ -140,7 +141,7 @@ export default function Editor({ id }: { id: string }) {
                 const clip = assetsFor(scene.index).find((a) => a.kind === "clip");
                 return (
                   <button key={scene.index} type="button" onClick={() => { setTab("scenes"); document.getElementById(`scene-${scene.index}`)?.scrollIntoView({ behavior: "smooth", block: "center" }); }} className="w-24 shrink-0 text-left">
-                    <div className="relative aspect-[9/16] overflow-hidden rounded-xl border border-white/[0.08] bg-ink">
+                    <div className={`relative ${long ? "aspect-video" : "aspect-[9/16]"} overflow-hidden rounded-xl border border-white/[0.08] bg-ink`}>
                       {clip?.status === "done" ? (clip.mode === "image"
                         ? <img src={fileUrl(video.id, "clip", `&scene=${scene.index}&v=${encodeURIComponent(clip.updatedAt)}`)} alt="" className="h-full w-full object-cover" />
                         : <video muted playsInline preload="metadata" src={`${fileUrl(video.id, "clip", `&scene=${scene.index}&v=${encodeURIComponent(clip.updatedAt)}`)}#t=0.5`} className="h-full w-full object-cover" />)
@@ -209,7 +210,7 @@ export default function Editor({ id }: { id: string }) {
               <div className="space-y-5">
                 <div>
                   <p className="mb-2 text-xs font-semibold text-mute">Video format</p>
-                  <div className="flex gap-2"><Chip on>9:16</Chip><span className="self-center text-[11px] text-dim">Shorts are always 1080×1920</span></div>
+                  <div className="flex gap-2"><Chip on>{long ? "16:9" : "9:16"}</Chip><span className="self-center text-[11px] text-dim">{long ? "Long videos render at 1920×1080" : "Shorts are always 1080×1920"}</span></div>
                 </div>
                 <div>
                   <p className="mb-2 text-xs font-semibold text-mute">Style</p>
@@ -218,7 +219,7 @@ export default function Editor({ id }: { id: string }) {
                 </div>
                 <label className="block">
                   <span className="mb-2 block text-xs font-semibold text-mute">Narration voice</span>
-                  <select value={settings.voiceId ?? ""} onChange={(e) => editSettings({ ...settings, voiceId: e.target.value || undefined, voiceProvider: e.target.value ? "free" : "auto" })} className="h-10 w-full rounded-xl border border-white/12 bg-ink px-3 text-sm outline-none">
+                  <select value={settings.voiceId ?? ""} onChange={(e) => editSettings({ ...settings, voiceId: e.target.value || undefined, voiceProvider: e.target.value ? (e.target.value.startsWith("aura") ? "deepgram" : "free") : "auto" })} className="h-10 w-full rounded-xl border border-white/12 bg-ink px-3 text-sm outline-none">
                     {VOICES.map((v) => <option key={v.id} value={v.id}>{v.label}</option>)}
                   </select>
                 </label>

@@ -1,4 +1,5 @@
 import type { AgentConfig } from "@/content/types";
+import { assertProviderAllowed } from "@/video/providers/policy";
 import { downloadMedia, httpRetryable, ProviderError, type ClipPoll, type ClipRequest, type ClipSubmission, type VideoProvider } from "@/video/providers/types";
 
 /**
@@ -24,12 +25,14 @@ export const falVideo: VideoProvider = {
   capabilities: { textToVideo: true, imageToVideo: true, clipDurations: [5, 10], seed: true, negativePrompt: true },
   isConfigured: () => Boolean(process.env.FAL_KEY),
   async submit(request: ClipRequest, config: AgentConfig): Promise<ClipSubmission> {
+    // PAID provider: refuses to run unless Free Mode is off AND this provider is enabled (second lock).
+    assertProviderAllowed("fal", Boolean(process.env.FAL_KEY), config);
     const model = request.imageDataUrl ? config.models.fal.imageToVideo : config.models.fal.textToVideo;
     if (!/^[\w.-]+\/[\w./-]+$/.test(model)) throw new ProviderError("Set a valid fal model id in Agent settings.", false);
     const input: Record<string, unknown> = {
       prompt: request.prompt,
       negative_prompt: request.negativePrompt,
-      aspect_ratio: "9:16",
+      aspect_ratio: request.aspectRatio,
       duration: String(request.durationSec > 7 ? 10 : 5),
       seed: request.seed,
       ...(request.imageDataUrl ? { image_url: request.imageDataUrl } : {}),
@@ -41,7 +44,8 @@ export const falVideo: VideoProvider = {
     if (typeof data.status_url !== "string" || typeof data.response_url !== "string") throw new ProviderError("fal.ai did not return a queue URL.", true);
     return { status: "pending", ref: JSON.stringify({ status: data.status_url, response: data.response_url }) };
   },
-  async poll(ref: string): Promise<ClipPoll> {
+  async poll(ref: string, config: AgentConfig): Promise<ClipPoll> {
+    assertProviderAllowed("fal", Boolean(process.env.FAL_KEY), config);
     const { status, response: responseUrl } = JSON.parse(ref) as { status: string; response: string };
     if (!/^https:\/\/queue\.fal\.run\//.test(status) || !/^https:\/\/queue\.fal\.run\//.test(responseUrl)) return { status: "failed", error: "Invalid fal.ai job reference.", retryable: false };
     const statusResponse = await fetch(status, { headers: authHeaders(), signal: AbortSignal.timeout(30_000), cache: "no-store" });
