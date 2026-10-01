@@ -1,5 +1,5 @@
 import { agentUploadMetadata, type AgentUploadMetadata } from "@/content/seo";
-import type { StoryPlan } from "@/content/types";
+import { isYouTubeShort, type StoryPlan, type VideoSettings } from "@/content/types";
 import { getVideoRow, updateVideo } from "@/jobs/repo";
 import { freshAccessToken, getAccount } from "@/lib/youtube";
 import { markCall, markFailure } from "@/lib/pipeline/usage";
@@ -67,7 +67,7 @@ export async function publishAgentVideo(videoId: string, opts: { requireApproved
         ? `Visuals: AI-generated images with camera motion and AI image-to-video clips${stockNote ? `, plus stock footage by ${stockNote}` : ""}. Narration: AI voice.`
         : "Made with AI-generated video, AI voice narration and synthesized music.";
   const privacy = (["private", "unlisted", "public"].includes(String(row.privacy)) ? row.privacy : "private") as "private" | "unlisted" | "public";
-  const metadata = agentUploadMetadata(story.seo, row.audience === "kids" ? "kids" : "general", privacy, disclosure, story.format === "long" ? "long" : "short");
+  const metadata = agentUploadMetadata(story.seo, row.audience === "kids" ? "kids" : "general", privacy, disclosure, isYouTubeShort({ ...(row.settings as VideoSettings), aspect: story.aspect ?? (row.settings as VideoSettings | null)?.aspect }, Number(row.duration_sec) || null) ? "short" : "long");
   let youtubeId: string;
   try {
     youtubeId = await resumableUpload(bytes, { ...metadata, status: { ...metadata.status, containsSyntheticMedia: true } });

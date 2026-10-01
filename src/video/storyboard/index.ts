@@ -22,9 +22,9 @@ const NEGATIVE = "text, captions, subtitles, watermark, logo, signature, extra l
 
 export type ScenePrompt = { prompt: string; negativePrompt: string; keyframePrompt: string; seed: number };
 
-export function scenePrompt(plan: StoryPlan, scene: PlanScene, style: VisualStyle, kidsSafe: boolean): ScenePrompt {
+export function scenePrompt(plan: StoryPlan, scene: PlanScene, style: VisualStyle, kidsSafe: boolean, aspect?: "9:16" | "16:9"): ScenePrompt {
   const niche = getNiche(plan.niche);
-  const landscape = plan.format === "long";
+  const landscape = (aspect ?? plan.aspect ?? (plan.format === "long" ? "16:9" : "9:16")) === "16:9";
   const cast = plan.characters.filter((character) => scene.characters.includes(character.id));
   const anchors = cast.map(characterAnchor).join("; ");
   const location = plan.locations?.find((item) => item.id === scene.location);

@@ -135,6 +135,8 @@ export function normalizeVideoSettings(input: unknown, base: VideoSettings = DEF
     privacy: pick(value.privacy ?? base.privacy, ["private", "unlisted", "public"] as const, "private"),
     idea: typeof (value.idea ?? base.idea) === "string" ? String(value.idea ?? base.idea).slice(0, 400) : undefined,
     script: script.length >= 20 ? script : undefined,
+    aspect: value.aspect === "9:16" || value.aspect === "16:9" ? value.aspect : base.aspect === "9:16" || base.aspect === "16:9" ? base.aspect : undefined,
+    pauseAfterStory: Boolean(value.pauseAfterStory ?? base.pauseAfterStory) || undefined,
   };
 }
 

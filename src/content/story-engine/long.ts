@@ -14,7 +14,7 @@ import type { LocationProfile, MusicMood, StoryPart, StoryPlan, VisualStyle } fr
  * retries the missing part (with the next provider in the chain).
  */
 
-export type LongRequest = { niche: string; subNiche?: string; idea?: string; targetDuration: number; style: VisualStyle; timezone: string; voiceGender?: "female" | "male" | "auto"; avoidTitles?: string[] };
+export type LongRequest = { aspect?: "9:16" | "16:9"; niche: string; subNiche?: string; idea?: string; targetDuration: number; style: VisualStyle; timezone: string; voiceGender?: "female" | "male" | "auto"; avoidTitles?: string[] };
 
 /** ~9 s per image keeps AI image generations low (one image per scene) while staying dynamic. */
 export const SECONDS_PER_SCENE = 9;
@@ -33,7 +33,7 @@ export function canWriteLong(nicheId: string) {
 
 function system(niche: NicheDefinition) {
   return [
-    "You are the head writer and director of a faceless YouTube channel that makes LONG-FORM narrated videos (several minutes, 16:9). Every scene becomes ONE AI-generated image that is animated, so describe shots precisely.",
+    "You are the head writer and director of a faceless YouTube channel that makes LONG-FORM narrated videos (several minutes). Every scene becomes ONE AI-generated image that is animated, so describe shots precisely.",
     ...STRATEGY_RULES,
     `Niche: ${niche.label}. Tone: ${niche.tone}. Rules: ${niche.storyRules}`,
     niche.fiction === "never" ? "This niche is FACTUAL: every claim must be accurate and well established. If unsure, choose a different, well-documented topic." : "This is ORIGINAL FICTION. Never present it as a real event.",
@@ -48,7 +48,7 @@ export async function generateLongOutline(request: LongRequest): Promise<StoryPl
   const parts = partCount(request.targetDuration);
   const minutes = Math.round(request.targetDuration / 60);
   const user = [
-    `Plan a ${minutes}-minute narrated YouTube video (16:9). Sub-niche: ${niche.subNiches.find((item) => item.id === sub)?.label ?? sub}.`,
+    `Plan a ${minutes}-minute narrated YouTube video (${request.aspect === "9:16" ? "vertical 9:16" : "widescreen 16:9"}). Sub-niche: ${niche.subNiches.find((item) => item.id === sub)?.label ?? sub}.`,
     request.idea ? `User idea: ${request.idea}` : "Pick a fresh, specific, gripping concept yourself.",
     `Visual style: ${request.style}; look: ${niche.visualKeywords}.`,
     request.voiceGender && request.voiceGender !== "auto" ? `Narrator voice: ${request.voiceGender}.` : "",
@@ -70,13 +70,16 @@ export async function generateLongOutline(request: LongRequest): Promise<StoryPl
     const name = text(value.name, 60) || `Location ${index + 1}`;
     return { id: slug(text(value.id, 30) || name) || `loc${index + 1}`, name, description: text(value.description, 300) };
   });
-  const rawParts = Array.isArray(json.parts) ? json.parts.slice(0, parts) : [];
-  if (rawParts.length < 2) throw new Error("The outline had too few parts.");
+  // Models sometimes return fewer parts, plain strings, or put them under another key — accept all of that.
+  const listed = [json.parts, json.chapters, json.acts, json.sections].find((value) => Array.isArray(value) && value.length) as unknown[] | undefined;
+  const rawParts: Record<string, unknown>[] = (listed ?? []).slice(0, parts).map((item) => (typeof item === "string" ? { summary: item } : typeof item === "object" && item !== null ? (item as Record<string, unknown>) : {}));
+  if (!text(json.title, 90) && !rawParts.length) throw new Error("The outline came back empty.");
+  while (rawParts.length < parts) {
+    const n = rawParts.length;
+    rawParts.push({ title: n === parts - 1 ? "The ending" : `Part ${n + 1}`, summary: n === parts - 1 ? `Resolve the story: ${text(json.ending, 300) || "a satisfying final payoff"}.` : `Continue the story and raise the stakes (part ${n + 1} of ${parts}).` });
+  }
   const per = Math.round(request.targetDuration / rawParts.length);
-  const storyParts: StoryPart[] = rawParts.map((item, index) => {
-    const value = (typeof item === "object" && item !== null ? item : {}) as Record<string, unknown>;
-    return { index, title: text(value.title, 80) || `Part ${index + 1}`, summary: text(value.summary, 500), targetSeconds: per, done: false };
-  });
+  const storyParts: StoryPart[] = rawParts.map((value, index) => ({ index, title: text(value.title ?? value.name, 80) || `Part ${index + 1}`, summary: text(value.summary ?? value.description ?? value.plot, 500), targetSeconds: per, done: false }));
   const isFiction = niche.fiction === "always" ? true : niche.fiction === "never" ? false : json.isFiction !== false;
   const moodRaw = text(json.musicMood, 20).toLowerCase() as MusicMood;
   const title = text(json.title, 90) || "Untitled";
@@ -99,6 +102,7 @@ export async function generateLongOutline(request: LongRequest): Promise<StoryPl
     source: "ai",
     model,
     format: "long",
+    aspect: request.aspect ?? "16:9",
     visualBible: text(json.visualBible, 600),
     locations,
     parts: storyParts,
@@ -136,7 +140,8 @@ export async function generateNextPart(plan: StoryPlan, request: Pick<LongReques
   ].filter(Boolean).join("\n");
   const { json } = await completeJson(system(niche), user, 4000);
   const locationIds = new Set((plan.locations ?? []).map((item) => item.id));
-  const rawScenes = Array.isArray(json.scenes) ? json.scenes : [];
+  const nested = typeof json.part === "object" && json.part !== null ? (json.part as Record<string, unknown>).scenes : undefined;
+  const rawScenes = ([json.scenes, nested, json.shots].find((value) => Array.isArray(value)) as unknown[] | undefined) ?? [];
   const offset = plan.scenes.length;
   const scenes = normalizeScenes(rawScenes, plan.characters, niche, part.targetSeconds, 16).map((scene, i) => {
     const raw = (rawScenes[i] ?? {}) as Record<string, unknown>;

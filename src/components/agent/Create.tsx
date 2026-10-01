@@ -3,7 +3,7 @@
 import { useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 import { ArrowRight, Check, CheckCircle2, Dices, Play, Sparkles } from "lucide-react";
-import { DEFAULT_VIDEO_SETTINGS, type AgentVideo, type VideoSettings, type VisualStyle } from "@/content/types";
+import { aspectOf, DEFAULT_VIDEO_SETTINGS, type AgentVideo, type VideoSettings, type VisualStyle } from "@/content/types";
 import { api, post, useAgent } from "./data";
 import { Button, Chip, Panel, Toggle } from "./ui";
 
@@ -43,7 +43,12 @@ export default function Create() {
   const [search, setSearch] = useState("");
   const [settings, setSettings] = useState<VideoSettings>({ ...DEFAULT_VIDEO_SETTINGS, format: initialFormat, targetDuration: initialFormat === "long" ? 300 : DEFAULT_VIDEO_SETTINGS.targetDuration });
   const long = settings.format === "long";
-  const setFormat = (format: "short" | "long") => setSettings((s) => ({ ...s, format, targetDuration: format === "long" ? 300 : 30 }));
+  const aspect = aspectOf(settings);
+  // Length and frame shape are separate choices; picking a length suggests the usual shape until you pick one yourself.
+  const [aspectPicked, setAspectPicked] = useState(false);
+  const setFormat = (format: "short" | "long") => setSettings((s) => ({ ...s, format, targetDuration: format === "long" ? 300 : 30, aspect: aspectPicked ? s.aspect : format === "long" ? "16:9" : "9:16" }));
+  const setAspect = (value: "9:16" | "16:9") => { setAspectPicked(true); setSettings((s) => ({ ...s, aspect: value })); };
+  const [customMin, setCustomMin] = useState("");
   const [busy, setBusy] = useState<"plan" | "produce" | null>(null);
   const current = niches.find((n) => n.id === niche);
 
@@ -77,8 +82,8 @@ export default function Create() {
     if (!idea) { notify("Pick or type a topic first.", "error"); setStep(1); return; }
     setBusy(mode);
     try {
-      const data = await api<{ video: AgentVideo; note: string | null }>("/api/agent/videos", post({ niche, mode: scriptMode ? "produce" : mode, settings: { ...settings, idea: scriptMode ? undefined : idea, script: scriptMode ? script : undefined } }));
-      notify(data.note ?? (mode === "plan" ? "Storyboard ready — review and edit it." : "Production started."));
+      const data = await api<{ video: AgentVideo; note: string | null }>("/api/agent/videos", post({ niche, mode, settings: { ...settings, aspect, idea: scriptMode ? undefined : idea, script: scriptMode ? script : undefined } }));
+      notify(data.note ?? (mode === "plan" ? (long || scriptMode ? "Writing the script — it appears here as it's written. Review it, then press Render video." : "Storyboard ready — review and edit it.") : "Production started."));
       void refresh(true);
       router.push(`/studio/videos/${data.video.id}`);
     } catch (error) { notify(error instanceof Error ? error.message : "Could not create the video.", "error"); }
@@ -137,7 +142,7 @@ export default function Create() {
                       <button key={`${item.niche.id}-${item.topic}`} type="button" onClick={() => { setTopic(item.topic); setNiche(item.niche.id); }}
                         className={`flex w-full items-center gap-3 rounded-2xl border px-3 py-3 text-left transition ${on ? "border-lime/60 bg-lime/[0.06] shadow-[0_0_0_1px_rgba(217,255,77,0.25)]" : "border-white/[0.07] bg-white/[0.02] hover:border-white/20"}`}>
                         <span className="grid h-10 w-10 place-items-center rounded-xl bg-white/[0.05] text-lg">{item.niche.emoji}</span>
-                        <span className="min-w-0 flex-1"><span className="block truncate text-sm font-bold">{item.topic}</span><span className="block text-[11px] text-dim">{item.niche.label} · {long ? "16:9" : "9:16"}</span></span>
+                        <span className="min-w-0 flex-1"><span className="block truncate text-sm font-bold">{item.topic}</span><span className="block text-[11px] text-dim">{item.niche.label} · {aspect}</span></span>
                         {on ? <CheckCircle2 className="h-5 w-5 text-lime" /> : <ArrowRight className="h-4 w-4 text-dim" />}
                       </button>
                     );
@@ -153,16 +158,38 @@ export default function Create() {
           <div className="space-y-5">
             <h2 className="font-display text-lg font-bold">2. Format</h2>
             <div>
-              <p className="mb-2 text-xs font-semibold text-mute">Choose format</p>
+              <p className="mb-2 text-xs font-semibold text-mute">Length</p>
               <div className="grid grid-cols-2 gap-3">
-                {([["short", "Short · 9:16", "1080×1920 for YouTube Shorts"], ["long", "Long · 16:9", "1920×1080, several minutes, written in parts"]] as const).map(([id, label, hint]) => (
+                {([["short", "Short", "Up to 60 seconds, one story"], ["long", "Long", "1–15 minutes, written in parts"]] as const).map(([id, label, hint]) => (
                   <button key={id} type="button" onClick={() => setFormat(id)} className={`rounded-2xl border p-4 text-left transition ${settings.format === id ? "border-lime/60 bg-lime/[0.06]" : "border-white/[0.07] hover:border-white/20"}`}><p className="font-bold">{label}</p><p className="text-[11px] text-dim">{hint}</p></button>
                 ))}
               </div>
             </div>
             <div>
+              <p className="mb-2 text-xs font-semibold text-mute">Frame (aspect ratio)</p>
+              <div className="grid grid-cols-2 gap-3">
+                {([["9:16", "9:16 · Vertical", "1080×1920 — Shorts, Reels, TikTok"], ["16:9", "16:9 · Widescreen", "1920×1080 — normal YouTube videos"]] as const).map(([id, label, hint]) => (
+                  <button key={id} type="button" onClick={() => setAspect(id)} className={`flex items-center gap-3 rounded-2xl border p-4 text-left transition ${aspect === id ? "border-lime/60 bg-lime/[0.06]" : "border-white/[0.07] hover:border-white/20"}`}>
+                    <span className={`shrink-0 rounded-[4px] border-2 ${aspect === id ? "border-lime" : "border-white/30"} ${id === "9:16" ? "h-8 w-[18px]" : "h-[18px] w-8"}`} />
+                    <span><span className="block font-bold">{label}</span><span className="block text-[11px] text-dim">{hint}</span></span>
+                  </button>
+                ))}
+              </div>
+              {aspect === "16:9" && !long && <p className="mt-2 text-[11px] text-dim">A 16:9 video uploads as a normal YouTube video, not a Short.</p>}
+              {aspect === "9:16" && long && settings.targetDuration > 180 && <p className="mt-2 text-[11px] text-dim">Vertical videos over 3 minutes upload as normal videos, not Shorts.</p>}
+            </div>
+            <div>
               <p className="mb-2 text-xs font-semibold text-mute">Duration{scriptMode ? " (follows your script)" : ""}</p>
-              {scriptMode ? <p className="rounded-xl border border-white/[0.07] px-4 py-3 text-sm">≈ {scriptSeconds >= 90 ? `${Math.round(scriptSeconds / 60)} min` : `${scriptSeconds}s`} — set by the length of your script.</p> : <div className="grid grid-cols-4 gap-2">{(long ? [180, 300, 480, 600] : [15, 30, 45, 60]).map((n) => <button key={n} type="button" onClick={() => set("targetDuration", n)} className={`h-12 rounded-xl border text-sm font-bold transition ${settings.targetDuration === n ? "border-lime bg-lime text-void" : "border-white/10 text-mute hover:text-cream"}`}>{long ? `${n / 60} min` : `${n}s`}</button>)}</div>}
+              {scriptMode ? <p className="rounded-xl border border-white/[0.07] px-4 py-3 text-sm">≈ {scriptSeconds >= 90 ? `${Math.round(scriptSeconds / 60)} min` : `${scriptSeconds}s`} — set by the length of your script.</p> : (
+                <>
+                  <div className="grid grid-cols-4 gap-2">{(long ? [120, 180, 300, 480, 600, 720, 900] : [15, 30, 45, 60]).map((n) => <button key={n} type="button" onClick={() => { set("targetDuration", n); setCustomMin(""); }} className={`h-12 rounded-xl border text-sm font-bold transition ${settings.targetDuration === n && !customMin ? "border-lime bg-lime text-void" : "border-white/10 text-mute hover:text-cream"}`}>{long ? `${n / 60} min` : `${n}s`}</button>)}</div>
+                  {long && (
+                    <label className="mt-2 flex items-center gap-2 text-[11px] text-dim">Or exactly
+                      <input inputMode="numeric" value={customMin} onChange={(e) => { const v = e.target.value.replace(/[^0-9]/g, "").slice(0, 2); setCustomMin(v); const m = Number(v); if (m >= 1 && m <= 15) set("targetDuration", m * 60); }} placeholder="7" className="h-9 w-16 rounded-lg border border-white/12 bg-white/[0.04] px-2 text-center text-sm text-cream outline-none focus:border-lime/50" />
+                      minutes (1–15)</label>
+                  )}
+                </>
+              )}
               <p className="mt-2 text-[11px] text-dim">{long ? `About ${Math.round(settings.targetDuration / 9)} scenes (one AI image each), written in ${Math.max(2, Math.round(settings.targetDuration / 60))} parts. Progress is saved after every part and scene.` : "The final length follows the real narration, close to this target."}</p>
             </div>
           </div>
@@ -214,17 +241,17 @@ export default function Create() {
                 [scriptMode ? "Mode" : "Topic", scriptMode ? `Script mode — your ${scriptWords} words, unchanged` : idea || "—"],
                 ["Niche", current ? `${current.emoji} ${current.label}` : niche],
                 ["Audience", current?.audience === "kids" ? "Made for kids" : "General (not made for kids)"],
-                ["Format", long ? `Long · 16:9 · ~${Math.round(settings.targetDuration / 60)} min` : `Short · 9:16 · ~${settings.targetDuration}s`],
+                ["Format", long ? `Long · ${aspect} · ~${Math.round(settings.targetDuration / 60)} min` : `Short · ${aspect} · ~${settings.targetDuration}s`],
                 ["Style", STYLES.find((s) => s.id === settings.style)?.label ?? settings.style],
                 ["Voice", VOICES.find((v) => v.id === (settings.voiceId ?? ""))?.label ?? "Match the niche"],
                 ["Visuals", (() => { const ai = overview?.status.providers.find((p) => p.usable); return ai && overview?.config.aiVideoScenes !== "none" ? `AI image per scene → ${ai.label} image-to-video (falls back to camera motion)` : "AI image per scene + camera motion"; })()],
               ].map(([k, v]) => <div key={k} className="flex justify-between gap-4 px-4 py-2.5"><dt className="text-dim">{k}</dt><dd className="text-right font-semibold">{v}</dd></div>)}
             </dl>
             <div className="grid gap-2 sm:grid-cols-2">
-              {!long && !scriptMode && <Button variant="outline" busy={busy === "plan"} disabled={busy !== null} onClick={() => void submit("plan")}><Sparkles className="h-4 w-4" /> Write storyboard first</Button>}
+              <Button variant="outline" busy={busy === "plan"} disabled={busy !== null} onClick={() => void submit("plan")}><Sparkles className="h-4 w-4" /> {long || scriptMode ? "Write script first" : "Write storyboard first"}</Button>
               <Button busy={busy === "produce"} disabled={busy !== null} onClick={() => void submit("produce")}><Play className="h-4 w-4" /> Produce now</Button>
             </div>
-            <p className="text-[11px] text-dim">Nothing is published automatically — every video waits for your approval.</p>
+            <p className="text-[11px] text-dim">{long || scriptMode ? "“Write script first” writes the full script and storyboard, then stops so you can read and edit it before any images or voice are made. " : ""}Nothing is published automatically — every video waits for your approval.</p>
           </div>
         )}
       </Panel>

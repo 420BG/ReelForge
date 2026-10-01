@@ -4,7 +4,8 @@ import {
   activeJobFor, cancelJobs, enqueueJob, getVideo, getVideoRow, resetAssets, resetFailedAssets, updateVideo,
 } from "@/jobs/repo";
 import { publishAgentVideo } from "@/jobs/youtube-upload";
-import type { AgentJob, StoryPlan } from "@/content/types";
+import type { AgentJob, StoryPlan, VideoSettings } from "@/content/types";
+import { storyComplete } from "@/content/story-engine/long";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -40,9 +41,13 @@ export async function POST(request: Request, context: Context) {
     };
 
     switch (action) {
-      case "produce":
-        await start(story?.scenes?.length ? "voice" : "story", "Production queued.");
+      case "produce": {
+        // A "write script first" video stops after the script; Produce clears that and carries on.
+        const settings = row.settings as VideoSettings | null;
+        if (settings?.pauseAfterStory) await updateVideo(id, { settings: { ...settings, pauseAfterStory: undefined } });
+        await start(storyComplete(story) ? "voice" : "story", "Production queued.");
         break;
+      }
       case "retry": {
         const last = (await getVideo(id))?.job;
         await resetFailedAssets(id);

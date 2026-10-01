@@ -57,7 +57,8 @@ export type AgentUploadMetadata = {
 export function agentUploadMetadata(seo: SeoPack, audience: Audience, privacy: "private" | "unlisted" | "public", aiDisclosure: string, format: "short" | "long" = "short"): AgentUploadMetadata {
   const base = seo.title.replace(/#shorts/gi, "").trim().slice(0, 88);
   const title = format === "long" ? base.slice(0, 100) : `${base} #Shorts`.slice(0, 100);
-  const description = [seo.description, aiDisclosure, seo.hashtags.join(" ")].filter(Boolean).join("\n\n").slice(0, 4900);
+  const hashtags = format === "long" ? seo.hashtags.filter((tag) => tag.toLowerCase() !== "#shorts") : seo.hashtags;
+  const description = [seo.description, aiDisclosure, hashtags.join(" ")].filter(Boolean).join("\n\n").slice(0, 4900);
   return {
     snippet: { title, description, tags: seo.tags.slice(0, 15), categoryId: seo.categoryId || "24" },
     status: { privacyStatus: privacy, selfDeclaredMadeForKids: audience === "kids" },

@@ -3,7 +3,7 @@
 import { useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowRight, CheckCircle2, Dices, Loader2, Play, RotateCcw, Send } from "lucide-react";
-import type { AgentVideo } from "@/content/types";
+import { aspectOf, type AgentVideo } from "@/content/types";
 import { api, post, useAgent } from "./data";
 import { Button, Chip, NavIcon, Panel, PanelTitle } from "./ui";
 
@@ -11,11 +11,19 @@ type Turn = { role: "user" | "agent"; text: string; video?: AgentVideo; note?: s
 
 function PlanCard({ video }: { video: AgentVideo }) {
   const story = video.story;
+  if (!story) {
+    return (
+      <div className="mt-3 rounded-2xl border border-white/[0.08] bg-void/60 p-4 text-xs text-mute">
+        <p className="flex items-center gap-2 font-semibold text-cream"><Loader2 className="h-3.5 w-3.5 animate-spin text-lime" /> Writing the script…</p>
+        <p className="mt-1.5">{video.settings.format === "long" ? "Long videos are written part by part" : "It's being written"} in the background — open the editor to read it as it appears. {video.settings.pauseAfterStory ? "It stops when the script is ready so you can review it, then press Render video." : ""}</p>
+      </div>
+    );
+  }
   const steps = [
     `Script generation — ${story?.scenes.length ?? 0} scenes${story?.source === "template" ? " (template writer)" : ""}`,
     `Scene creation (${video.settings.style.replace("-", " ")} style)`,
     `Narration (${video.settings.voiceGender === "auto" ? "voice matched to niche" : `${video.settings.voiceGender} voice`})`,
-    `Render video (vertical 9:16, ~${video.settings.targetDuration}s)`,
+    `Render video (${aspectOf(video.settings) === "16:9" ? "widescreen 16:9" : "vertical 9:16"}, ~${video.settings.targetDuration >= 90 ? `${Math.round(video.settings.targetDuration / 60)} min` : `${video.settings.targetDuration}s`})`,
     "Review, then upload to YouTube when you approve",
   ];
   return (
@@ -33,6 +41,10 @@ export default function Chat() {
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [seed, setSeed] = useState(0);
+  // Optional pickers: when set they win over what's guessed from the message.
+  const [length, setLength] = useState(0);
+  const [aspect, setAspect] = useState<"auto" | "9:16" | "16:9">("auto");
+  const [reviewFirst, setReviewFirst] = useState(false);
   const endRef = useRef<HTMLDivElement | null>(null);
   const params = useSearchParams();
   const router = useRouter();
@@ -76,7 +88,7 @@ export default function Chat() {
     setBusy(true);
     try {
       const history = turns.slice(-10).map((turn) => ({ role: turn.role, text: turn.text }));
-      const data = await api<{ reply: string; note: string | null; video: AgentVideo | null }>("/api/agent/chat", post({ message, history }));
+      const data = await api<{ reply: string; note: string | null; video: AgentVideo | null }>("/api/agent/chat", post({ message, history, length, aspect: aspect === "auto" ? undefined : aspect, reviewFirst }));
       setTurns((t) => [...t, { role: "agent", text: data.reply, video: data.video ?? undefined, note: data.note }]);
     } catch (error) {
       setTurns((t) => [...t, { role: "agent", text: error instanceof Error ? error.message : "Something went wrong." }]);
@@ -113,10 +125,10 @@ export default function Chat() {
               <div className="min-w-0 flex-1 whitespace-pre-wrap break-words rounded-2xl rounded-tl-sm bg-white/[0.04] px-4 py-3 text-sm leading-relaxed text-cream">
                 {turn.text}
                 {turn.note && <p className="mt-2 text-[11px] text-amber-200">{turn.note}</p>}
-                {turn.video && turn.video.workflow === "draft" && <PlanCard video={turn.video} />}
+                {turn.video && (turn.video.workflow === "draft" || !turn.video.story) && <PlanCard video={turn.video} />}
                 {turn.video && (
                   <div className="mt-3 flex flex-wrap gap-2">
-                    {turn.video.workflow === "draft" && <Button onClick={() => void produce(turn.video!)} className="h-9 text-xs"><Play className="h-3.5 w-3.5" /> Produce now</Button>}
+                    {turn.video.workflow === "draft" && turn.video.story && <Button onClick={() => void produce(turn.video!)} className="h-9 text-xs"><Play className="h-3.5 w-3.5" /> Produce now</Button>}
                     <Button href={`/studio/videos/${turn.video.id}`} variant="outline" className="h-9 text-xs">Open editor <ArrowRight className="h-3.5 w-3.5" /></Button>
                   </div>
                 )}
@@ -126,7 +138,20 @@ export default function Chat() {
           {busy && <div className="flex items-center gap-2 text-xs text-dim"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Thinking…</div>}
           <div ref={endRef} />
         </div>
-        <form onSubmit={(e) => { e.preventDefault(); void send(input); }} className="mt-4 flex items-end gap-2 rounded-2xl border border-white/10 bg-void/60 p-1.5 pl-4">
+        <div className="mt-4 flex flex-wrap items-center gap-2 text-[11px] text-dim">
+          <label className="flex items-center gap-1.5">Length
+            <select value={length} onChange={(e) => setLength(Number(e.target.value))} className="h-8 rounded-lg border border-white/12 bg-ink px-2 text-xs text-cream outline-none focus:border-lime/50">
+              {[[0, "Auto"], [15, "15 s"], [30, "30 s"], [45, "45 s"], [60, "60 s"], [120, "2 min"], [180, "3 min"], [300, "5 min"], [480, "8 min"], [600, "10 min"], [900, "15 min"]].map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+            </select>
+          </label>
+          <label className="flex items-center gap-1.5">Frame
+            <select value={aspect} onChange={(e) => setAspect(e.target.value as "auto" | "9:16" | "16:9")} className="h-8 rounded-lg border border-white/12 bg-ink px-2 text-xs text-cream outline-none focus:border-lime/50">
+              <option value="auto">Auto</option><option value="9:16">9:16 vertical</option><option value="16:9">16:9 widescreen</option>
+            </select>
+          </label>
+          <label className="flex items-center gap-1.5"><input type="checkbox" checked={reviewFirst} onChange={(e) => setReviewFirst(e.target.checked)} className="accent-lime" />Script first (Long / my script)</label>
+        </div>
+        <form onSubmit={(e) => { e.preventDefault(); void send(input); }} className="mt-2 flex items-end gap-2 rounded-2xl border border-white/10 bg-void/60 p-1.5 pl-4">
           <textarea value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void send(input); } }} rows={Math.min(8, Math.max(1, input.split("\n").length))} maxLength={16000} placeholder="Ask anything, or paste a script…" className="max-h-48 min-h-[40px] flex-1 resize-none bg-transparent py-2.5 text-sm outline-none placeholder:text-dim" />
           <button type="submit" disabled={busy || !input.trim()} aria-label="Send" className="grid h-10 w-10 place-items-center rounded-xl bg-lime text-void disabled:opacity-40"><Send className="h-4 w-4" /></button>
         </form>

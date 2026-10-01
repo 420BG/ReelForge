@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { isModelGone, modelCandidates, rememberModel } from "@/lib/models";
 import { isExhausted, looksLikeQuotaError, markCall, markFailure } from "@/lib/pipeline/usage";
 
@@ -22,7 +23,21 @@ export function extractJson(text: string): Record<string, unknown> | null {
 type CallResult = { status: number; text: string; content?: string };
 type Provider = { id: string; enabled: () => boolean; call: (model: string, system: string, user: string, maxTokens: number, json: boolean) => Promise<CallResult> };
 
-const timeout = () => AbortSignal.timeout(process.env.VERCEL ? 60_000 : 75_000);
+/**
+ * Every model call gets at most 60–75 s, and never more than what's left of this step's budget,
+ * so one slow provider can't push a step past Vercel's 300 s limit (which would kill the step
+ * silently and retry it forever). The budget is per call chain (AsyncLocalStorage = safe with
+ * concurrent requests in one instance).
+ */
+const deadline = new AsyncLocalStorage<number>();
+const PER_CALL_MS = process.env.VERCEL ? 60_000 : 75_000;
+const timeout = () => {
+  const until = deadline.getStore();
+  const left = until ? until - Date.now() - 2_000 : PER_CALL_MS;
+  return AbortSignal.timeout(Math.max(1_000, Math.min(PER_CALL_MS, left)));
+};
+/** Default time budget for one completeJson() chain: leaves room for DB work inside a 300 s Vercel function. */
+const DEFAULT_BUDGET_MS = process.env.VERCEL ? 170_000 : 600_000;
 
 async function chatCompletions(url: string, key: string, model: string, system: string, user: string, maxTokens: number, extra: Record<string, unknown> = {}, headers: Record<string, string> = {}): Promise<CallResult> {
   const response = await fetch(url, {
@@ -143,14 +158,21 @@ export function textModelStatus() {
 }
 
 /** Walks the provider chain (skipping unconfigured / exhausted ones). Throws if none answers with JSON. */
-export async function completeJson(system: string, user: string, maxTokens = 3500): Promise<LlmResult> {
+export async function completeJson(system: string, user: string, maxTokens = 3500, budgetMs = DEFAULT_BUDGET_MS): Promise<LlmResult> {
+  const until = Date.now() + budgetMs;
+  return deadline.run(until, () => walkProviders(system, user, maxTokens, until));
+}
+
+async function walkProviders(system: string, user: string, maxTokens: number, until: number): Promise<LlmResult> {
   const errors: string[] = [];
   for (const provider of PROVIDERS) {
+    if (until - Date.now() < 12_000) { errors.push("out of time for this step — will continue on the next run"); break; }
     if (!provider.enabled()) continue;
     if (await isExhausted(provider.id)) { errors.push(`${provider.id}: daily quota used`); continue; }
     if ((cooldownUntil.get(provider.id) ?? 0) > Date.now()) { errors.push(`${provider.id}: rate-limited, cooling down`); continue; }
     let lastError = "";
     for (const model of modelsFor(provider).slice(0, 4)) {
+      if (until - Date.now() < 12_000) break;
       try {
         let result = await provider.call(model, system, user, maxTokens, true);
         // Some models reject JSON mode — retry once without it.
@@ -171,6 +193,11 @@ export async function completeJson(system: string, user: string, maxTokens = 350
         return { json, model: `${provider.id}:${model}` };
       } catch (error) {
         lastError = error instanceof Error ? error.message : String(error);
+        // Too slow right now: let the next providers go first for a few minutes.
+        if (error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError" || /timeout|aborted/i.test(error.message))) {
+          cooldownUntil.set(provider.id, Date.now() + 5 * 60_000);
+          lastError = `${model}: too slow (timed out)`;
+        }
         break;
       }
     }

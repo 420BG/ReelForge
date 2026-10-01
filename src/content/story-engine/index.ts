@@ -15,6 +15,7 @@ export type StoryRequest = {
   timezone: string;
   voiceGender?: "female" | "male" | "auto";
   avoidTitles?: string[];
+  aspect?: "9:16" | "16:9";
 };
 
 const SFX_VOCAB = "wind, rain, thunder, heartbeat, footsteps, knock, door creak, whoosh, impact, riser, electrical hum, clock tick, phone ring, phone vibrate, glitch, city night, ocean waves, fire crackle, birds, chime, soft rain, crowd";
@@ -46,7 +47,7 @@ function buildPrompt(niche: NicheDefinition, request: StoryRequest, sceneCount: 
     "Keep 1–2 main characters maximum so they stay consistent across shots.",
   ].join("\n");
   const user = [
-    `Write a ${request.targetDuration}-second vertical Short. Sub-niche: ${sub}.`,
+    `Write a ${request.targetDuration}-second ${request.aspect === "16:9" ? "widescreen 16:9" : "vertical"} Short. Sub-niche: ${sub}.`,
     request.idea ? `User idea: ${request.idea}` : "Pick a fresh, specific concept yourself.",
     `Visual style: ${request.style}; look: ${niche.visualKeywords}.`,
     `Narration total about ${words} words (≈${WORDS_PER_SECOND} words/second). The hook scene narration must be ≤ 3 seconds.`,

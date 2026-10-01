@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useEffect, useState } from "react";
 import { AlertTriangle, CheckCircle2, ExternalLink, Film, Loader2, Upload } from "lucide-react";
 import { useStudio } from "@/components/studio/StudioContext";
-import type { AgentVideo, StoryPlan } from "@/content/types";
+import { aspectOf, isYouTubeShort, type AgentVideo, type StoryPlan } from "@/content/types";
 import { api, fileUrl, formatDuration, post, useAgent } from "./data";
 import { Button, Chip, Panel } from "./ui";
 
@@ -68,8 +68,8 @@ export default function Publish({ id }: { id: string }) {
 
       <div className="grid gap-5 md:grid-cols-[220px_1fr]">
         <div className="overflow-hidden rounded-2xl border border-white/[0.08] bg-ink">
-          {video.hasCover ? <img src={fileUrl(video.id, "cover")} alt="" className={`${video.settings.format === "long" ? "aspect-video" : "aspect-[9/16]"} w-full object-cover`} /> : <div className="grid aspect-[9/16] place-items-center text-dim"><Film className="h-6 w-6" /></div>}
-          <div className="p-3 text-[11px] text-dim"><p className="font-bold text-cream">{video.title}</p>{formatDuration(video.durationSec)} · {video.settings.format === "long" ? "16:9" : "9:16"} · {video.niche}</div>
+          {video.hasCover ? <img src={fileUrl(video.id, "cover")} alt="" className={`${aspectOf(video.settings) === "16:9" ? "aspect-video" : "aspect-[9/16]"} w-full object-cover`} /> : <div className="grid aspect-[9/16] place-items-center text-dim"><Film className="h-6 w-6" /></div>}
+          <div className="p-3 text-[11px] text-dim"><p className="font-bold text-cream">{video.title}</p>{formatDuration(video.durationSec)} · {aspectOf(video.settings)} · {video.niche}</div>
         </div>
 
         <Panel>
@@ -94,7 +94,7 @@ export default function Publish({ id }: { id: string }) {
               {step === 2 && (
                 <div className="space-y-2 text-sm text-mute">
                   <p>The cover on the left is generated from your first scene with the title burned in.</p>
-                  <p className="text-[11px] text-dim">{video.settings.format === "long" ? "Download the cover and set it as the custom thumbnail in YouTube Studio (custom thumbnails need a verified channel)." : "For Shorts, YouTube picks the thumbnail from the video frames; custom thumbnail upload for Shorts isn't supported by the YouTube API."}</p>
+                  <p className="text-[11px] text-dim">{!isYouTubeShort(video.settings, video.durationSec) ? "Download the cover and set it as the custom thumbnail in YouTube Studio (custom thumbnails need a verified channel)." : "For Shorts, YouTube picks the thumbnail from the video frames; custom thumbnail upload for Shorts isn't supported by the YouTube API."}</p>
                   {video.hasCover && <Button variant="outline" href={fileUrl(video.id, "cover", "&download=1")} className="text-xs">Download cover</Button>}
                 </div>
               )}
@@ -110,7 +110,7 @@ export default function Publish({ id }: { id: string }) {
                   {!yt.connected && <div className="flex gap-2 rounded-xl border border-amber-300/25 bg-amber-300/[0.07] p-3 text-xs text-amber-100"><AlertTriangle className="h-4 w-4 shrink-0" /> Connect YouTube first on the <Link href="/studio/youtube" className="font-bold text-lime underline">YouTube page</Link>.</div>}
                   {!video.hasFinal && <p className="text-xs text-red-300">Render the video before publishing.</p>}
                   <dl className="divide-y divide-white/[0.06] rounded-2xl border border-white/[0.07]">
-                    {[["Title", video.settings.format === "long" ? seo.title : `${seo.title} #Shorts`], ["Visibility", privacy], ["Channel", yt.channelTitle ?? (yt.connected ? "Connected" : "Not connected")]].map(([k, v]) => <div key={k} className="flex justify-between gap-3 px-4 py-2.5"><dt className="text-dim">{k}</dt><dd className="truncate text-right font-semibold">{v}</dd></div>)}
+                    {[["Title", !isYouTubeShort(video.settings, video.durationSec) ? seo.title : `${seo.title} #Shorts`], ["Visibility", privacy], ["Channel", yt.channelTitle ?? (yt.connected ? "Connected" : "Not connected")]].map(([k, v]) => <div key={k} className="flex justify-between gap-3 px-4 py-2.5"><dt className="text-dim">{k}</dt><dd className="truncate text-right font-semibold">{v}</dd></div>)}
                   </dl>
                   <Button onClick={() => void publish()} busy={busy} disabled={!canPublish || !yt.connected} className="w-full"><Upload className="h-4 w-4" /> Approve & publish to YouTube</Button>
                 </div>

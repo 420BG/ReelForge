@@ -1,4 +1,5 @@
 import { getNiche, isKnownNiche } from "@/content/niches/registry";
+import { aspectOf } from "@/content/types";
 import { continueInBackground } from "@/jobs/worker";
 import { generateStoryPlan } from "@/content/story-engine";
 import { fail, guard } from "@/jobs/api-helpers";
@@ -37,13 +38,17 @@ export async function POST(request: Request) {
     if (body.mode === "plan" && settings.format !== "long" && !settings.script) {
       const { plan, note } = await generateStoryPlan({
         niche: niche.id, subNiche: subNiche ?? undefined, idea: settings.idea, targetDuration: settings.targetDuration, style: settings.style,
-        maxScenes: config.maxScenesPerVideo, timezone: config.timezone, voiceGender: settings.voiceGender, avoidTitles: await recentTitles(20),
+        maxScenes: config.maxScenesPerVideo, timezone: config.timezone, voiceGender: settings.voiceGender, avoidTitles: await recentTitles(20), aspect: aspectOf(settings),
       });
+      plan.format = "short";
+      plan.aspect = aspectOf(settings);
       const video = await createVideo({ niche: niche.id, subNiche: plan.subNiche, settings, story: plan, audience: niche.audience });
       return Response.json({ video: await getVideo(video.id), note }, { status: 201 });
     }
+    // "Write script first" for Long / script videos: write it in the background, then stop for review.
+    if (body.mode === "plan") settings.pauseAfterStory = true;
     const video = await createVideo({ niche: niche.id, subNiche, settings, audience: niche.audience });
-    await enqueueJob(video.id, "story", "Queued from Create.");
+    await enqueueJob(video.id, "story", body.mode === "plan" ? "Writing the script for review." : "Queued from Create.");
     continueInBackground(new URL(request.url).origin);
     return Response.json({ video: await getVideo(video.id), note: null }, { status: 201 });
   } catch (error) {

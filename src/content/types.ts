@@ -102,6 +102,8 @@ export type StoryPlan = {
   source: "ai" | "template";
   model?: string;
   format?: VideoFormat;
+  /** Frame shape the images were designed for (unset on older plans: Long = 16:9, else 9:16). */
+  aspect?: Aspect;
   /** Shared look for every image in this story (style, palette, lighting). */
   visualBible?: string;
   locations?: LocationProfile[];
@@ -143,7 +145,22 @@ export type VideoSettings = {
   idea?: string;
   /** SCRIPT MODE: the user's narration, used word for word (the AI only designs the visuals). */
   script?: string;
+  /** Frame shape, chosen independently of length. Unset = Short 9:16, Long 16:9 (older videos). */
+  aspect?: Aspect;
+  /** Write the script/storyboard, then stop so you can review it before anything is generated. */
+  pauseAfterStory?: boolean;
 };
+
+export type Aspect = "9:16" | "16:9";
+/** The frame shape of a video: its own setting if set, otherwise Short = 9:16, Long = 16:9. */
+export function aspectOf(settings: Pick<VideoSettings, "format" | "aspect"> | null | undefined): Aspect {
+  if (settings?.aspect === "9:16" || settings?.aspect === "16:9") return settings.aspect;
+  return settings?.format === "long" ? "16:9" : "9:16";
+}
+/** True only for vertical videos up to 3 minutes — what YouTube treats as a Short. */
+export function isYouTubeShort(settings: Pick<VideoSettings, "format" | "aspect" | "targetDuration"> | null | undefined, seconds?: number | null) {
+  return aspectOf(settings) === "9:16" && (seconds ?? settings?.targetDuration ?? 0) <= 180;
+}
 
 export const DEFAULT_CAPTIONS: CaptionSettings = {
   font: "auto",

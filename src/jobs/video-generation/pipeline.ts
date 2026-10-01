@@ -4,7 +4,7 @@ import { getNiche } from "@/content/niches/registry";
 import { generateStoryPlan } from "@/content/story-engine";
 import { canWriteLong, generateLongOutline, generateNextPart, storyComplete } from "@/content/story-engine/long";
 import { outlineFromScript, writeScriptPart } from "@/content/story-engine/script";
-import type { AgentConfig, AgentJob, PlanScene, StoryPlan, VideoSettings } from "@/content/types";
+import { aspectOf, type AgentConfig, type AgentJob, type PlanScene, type StoryPlan, type VideoSettings } from "@/content/types";
 import { generateVoiceStep } from "@/jobs/voice-generation";
 import {
   extendLease, getAssets, getConfig, getVideoRow, logJob, normalizeVideoSettings, recentTitles, recordUsage, updateVideo, upsertAsset, usageToday, type AssetRow,
@@ -58,12 +58,20 @@ const QUOTA_WAIT = 1800;
 
 type Ctx = { job: AgentJob; videoId: string; story: StoryPlan | null; settings: VideoSettings; config: AgentConfig; row: Record<string, unknown> };
 const isLong = (ctx: Ctx) => ctx.settings.format === "long";
-const aspectOf = (ctx: Ctx) => (isLong(ctx) ? "16:9" as const : "9:16" as const);
+const aspectFor = (ctx: Ctx) => aspectOf(ctx.settings);
 
 /* ---------------- story ---------------- */
 
+/** After the script is written: stop for review (Write script first) or go straight on to voice. */
+async function afterStory(ctx: Ctx, plan: StoryPlan): Promise<StepOutcome> {
+  if (!ctx.settings.pauseAfterStory) return { state: "queued", step: "voice", progress: progressFor("story", 1) };
+  await updateVideo(ctx.videoId, { workflow: "draft", error: null });
+  await logJob(ctx.job.id, "info", `Script ready: “${plan.title}” — ${plan.scenes.length} scenes. Review or edit it, then press Produce.`);
+  return { state: "done", step: "done", progress: progressFor("story", 1), currentScene: null };
+}
+
 async function storyStep(ctx: Ctx): Promise<StepOutcome> {
-  if (storyComplete(ctx.story)) return { state: "queued", step: "voice", progress: progressFor("story", 1) };
+  if (storyComplete(ctx.story)) return afterStory(ctx, ctx.story!);
   const niche = getNiche(String(ctx.row.niche));
   const warnings = Array.isArray(ctx.row.warnings) ? (ctx.row.warnings as string[]) : [];
 
@@ -79,6 +87,7 @@ async function storyStep(ctx: Ctx): Promise<StepOutcome> {
       if (!ctx.story && scriptMode) {
         await logJob(ctx.job.id, "info", "Script mode: reading your script (your words are kept exactly) and planning the visuals…");
         const plan = await outlineFromScript({ niche: niche.id, script: ctx.settings.script!, style: ctx.settings.style, format: ctx.settings.format, timezone: ctx.config.timezone });
+        plan.aspect = aspectFor(ctx);
         await updateVideo(ctx.videoId, { story: plan, title: plan.title, hook: plan.hook, sub_niche: plan.subNiche || null });
         await upsertAsset(ctx.videoId, 0, "story", { status: "done", attempts: 0, error: null, next_attempt_at: null });
         await logJob(ctx.job.id, "info", `Storyboard plan ready: “${plan.title}” — ${plan.parts?.length} part(s), ${plan.characters.length} characters (${plan.model ?? "built-in planner"}).`);
@@ -86,7 +95,7 @@ async function storyStep(ctx: Ctx): Promise<StepOutcome> {
       }
       if (!ctx.story) {
         await logJob(ctx.job.id, "info", `Planning a ${Math.round(ctx.settings.targetDuration / 60)}-minute ${niche.label} video in parts…`);
-        const plan = await generateLongOutline({ niche: niche.id, subNiche: (ctx.row.sub_niche as string) ?? undefined, idea: ctx.settings.idea, targetDuration: ctx.settings.targetDuration, style: ctx.settings.style, timezone: ctx.config.timezone, voiceGender: ctx.settings.voiceGender, avoidTitles: await recentTitles(20) });
+        const plan = await generateLongOutline({ niche: niche.id, subNiche: (ctx.row.sub_niche as string) ?? undefined, idea: ctx.settings.idea, targetDuration: ctx.settings.targetDuration, style: ctx.settings.style, timezone: ctx.config.timezone, voiceGender: ctx.settings.voiceGender, avoidTitles: await recentTitles(20), aspect: aspectFor(ctx) });
         await updateVideo(ctx.videoId, { story: plan, title: plan.title, hook: plan.hook, sub_niche: plan.subNiche || null });
         await upsertAsset(ctx.videoId, 0, "story", { status: "done", attempts: 0, error: null, next_attempt_at: null });
         await logJob(ctx.job.id, "info", `Outline ready: “${plan.title}” — ${plan.parts?.length} parts, ${plan.characters.length} characters, ${plan.locations?.length ?? 0} locations (${plan.model}).`);
@@ -99,7 +108,7 @@ async function storyStep(ctx: Ctx): Promise<StepOutcome> {
       await upsertAsset(ctx.videoId, slot, "story", { status: "done", attempts: 0, error: null, next_attempt_at: null });
       await logJob(ctx.job.id, "info", `Part ${partIndex + 1}/${total} written (${next.scenes.length} scenes so far).`);
       return storyComplete(next)
-        ? { state: "queued", step: "voice", progress: progressFor("story", 1) }
+        ? afterStory(ctx, next)
         : { state: "queued", step: "story", progress: progressFor("story", 0.15 + 0.85 * (done / total)) };
     } catch (error) {
       // Never restart: keep what's written, retry only this part (the model chain moves on to the next provider).
@@ -123,11 +132,13 @@ async function storyStep(ctx: Ctx): Promise<StepOutcome> {
     timezone: ctx.config.timezone,
     voiceGender: ctx.settings.voiceGender,
     avoidTitles: await recentTitles(20),
+    aspect: aspectFor(ctx),
   });
   plan.format = "short";
+  plan.aspect = aspectFor(ctx);
   await updateVideo(ctx.videoId, { story: plan, title: plan.title, hook: plan.hook, sub_niche: plan.subNiche || null, warnings: note ? [...warnings, note] : warnings });
   await logJob(ctx.job.id, note ? "warn" : "info", note ?? `Story ready: “${plan.title}” — ${plan.scenes.length} scenes (${plan.source === "ai" ? plan.model : "template writer"}).`);
-  return { state: "queued", step: "voice", progress: progressFor("story", 1) };
+  return afterStory(ctx, plan);
 }
 
 /* ---------------- visuals ---------------- */
@@ -176,7 +187,7 @@ function wantsAiVideo(ctx: Ctx, scene: PlanScene) {
 async function clipsStep(ctx: Ctx): Promise<StepOutcome> {
   const story = ctx.story!;
   const total = story.scenes.length;
-  const aspect = aspectOf(ctx);
+  const aspect = aspectFor(ctx);
   const chain = videoProviderChain(ctx.settings, ctx.config);
   const clips = new Map((await getAssets(ctx.videoId, "clip")).map((asset) => [asset.scene_index, asset]));
   const keyframes = new Map((await getAssets(ctx.videoId, "keyframe")).map((asset) => [asset.scene_index, asset]));
@@ -189,7 +200,7 @@ async function clipsStep(ctx: Ctx): Promise<StepOutcome> {
     const i = scene.index;
     const clip = clips.get(i);
     if (clip?.status === "done" && (await storedLooksPresent(clip.path))) continue;
-    const prompts = scenePrompt(story, scene, ctx.settings.style, ctx.settings.audience === "kids");
+    const prompts = scenePrompt(story, scene, ctx.settings.style, ctx.settings.audience === "kids", aspect);
 
     // 0) An AI clip already submitted: poll it (the provider is remembered on the asset).
     if (clip?.status === "running" && clip.provider_ref && clip.provider) {
@@ -377,7 +388,7 @@ async function segmentsStep(ctx: Ctx): Promise<StepOutcome> {
   const plan = await composePlan(ctx);
   if (!plan) return { state: "queued", step: "clips" };
   const niche = getNiche(ctx.story!.niche);
-  const dims = dimsFor(ctx.settings.format);
+  const dims = dimsFor(aspectFor(ctx));
   const segments = new Map((await getAssets(ctx.videoId, "segment")).map((asset) => [asset.scene_index, asset]));
   const total = plan.scenes.length;
   for (const [i, scene] of plan.scenes.entries()) {
@@ -425,7 +436,7 @@ async function renderGroup(ctx: Ctx, group: Group, outFile: string, coverFile: s
     quality: ctx.settings.quality,
     maxDuration: group.maxDuration,
     outFile, coverFile,
-    dims: dimsFor(ctx.settings.format),
+    dims: dimsFor(aspectFor(ctx)),
     partMode,
     onProgress: async (label) => { await extendLease(ctx.job.id, 330); await logJob(ctx.job.id, "info", `${partMode ? `Part ${group.index + 1}: ` : ""}${label}`); },
   });
@@ -463,7 +474,7 @@ async function composeStep(ctx: Ctx): Promise<StepOutcome> {
   const scratch = await ensureScratch(ctx.videoId);
   const outFile = path.join(scratch, "final.mp4");
   const coverFile = path.join(scratch, "cover.jpg");
-  const dims = dimsFor(ctx.settings.format);
+  const dims = dimsFor(aspectFor(ctx));
   let duration: number;
   let composeWarnings: string[] = [];
   let hasCover = false;

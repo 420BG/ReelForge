@@ -14,9 +14,9 @@ import { captionFonts, probe, runFfmpeg } from "@/video/composition/ffmpeg";
 
 export const OUTPUT = { width: 1080, height: 1920, fps: 30 } as const;
 export type Dims = { width: number; height: number; fps: number };
-/** Shorts are 1080×1920 (9:16); long videos are 1920×1080 (16:9). */
-export function dimsFor(format: "short" | "long" | undefined): Dims {
-  return format === "long" ? { width: 1920, height: 1080, fps: 30 } : { ...OUTPUT };
+/** 9:16 renders at 1080×1920, 16:9 at 1920×1080. Accepts an aspect ("9:16"/"16:9") or, for older callers, a format ("short"/"long"). */
+export function dimsFor(shape: "short" | "long" | "9:16" | "16:9" | undefined): Dims {
+  return shape === "long" || shape === "16:9" ? { width: 1920, height: 1080, fps: 30 } : { ...OUTPUT };
 }
 
 export type ComposeScene = {

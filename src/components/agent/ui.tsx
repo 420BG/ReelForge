@@ -3,7 +3,7 @@
 import Link from "next/link";
 import type { ReactNode } from "react";
 import { Film, Loader2, Trash2 } from "lucide-react";
-import type { AgentVideo, Workflow } from "@/content/types";
+import { aspectOf, type AgentVideo, type Workflow } from "@/content/types";
 import { fileUrl, formatDuration } from "./data";
 
 /* Small, dependency-free icons for the nav (keeps us on icons we know exist). */
@@ -137,7 +137,7 @@ export function VideoCard({ video, compact = false, onDelete, selectMode = false
           : <div className="grid h-full w-full place-items-center bg-gradient-to-b from-violet/20 to-void text-dim"><Film className="h-7 w-7" /></div>}
         <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/85 to-transparent p-2.5 pt-10">
           <p className={`font-display font-bold leading-tight text-cream ${compact ? "text-[11px]" : "text-sm"} line-clamp-2`}>{video.title || "Writing story…"}</p>
-          <p className="mt-0.5 text-[10px] text-mute">{video.settings.format === "long" ? "Long · 16:9" : "Short · 9:16"} · {formatDuration(video.durationSec ?? video.settings.targetDuration)}</p>
+          <p className="mt-0.5 text-[10px] text-mute">{video.settings.format === "long" ? "Long" : "Short"} · {aspectOf(video.settings)} · {formatDuration(video.durationSec ?? video.settings.targetDuration)}</p>
         </div>
         <div className="absolute left-2 top-2"><ModeBadge video={video} /></div>
         {selectMode && (
