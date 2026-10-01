@@ -5,7 +5,7 @@ export const dynamic = "force-dynamic";
 
 export async function GET(req: Request) {
   if (!youtubeConfigured()) {
-    const url = new URL("/studio", req.url);
+    const url = new URL("/studio/youtube", req.url);
     url.searchParams.set("yt", "unconfigured");
     return NextResponse.redirect(url);
   }

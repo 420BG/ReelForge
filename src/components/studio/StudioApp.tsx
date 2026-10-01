@@ -77,6 +77,10 @@ export interface YtStatus {
   connected: boolean;
   channelTitle: string | null;
   channelId: string | null;
+  /** Set once /api/youtube/status has answered (undefined = still checking). */
+  checked?: boolean;
+  /** Keys are set but the status lookup failed — shown instead of "keys missing". */
+  error?: string | null;
 }
 
 const PENDING = new Set(["queued", "script", "media", "render", "upload"]);
@@ -181,11 +185,11 @@ export default function StudioApp() {
   useEffect(() => {
     fetch("/api/series").then((r) => r.json()).then((d) => setSeries(d.items)).catch(() => {});
     fetch("/api/providers").then((r) => r.json()).then((d) => setProviders(d.items)).catch(() => {});
-    fetch("/api/youtube/status").then((r) => r.json()).then(setYt).catch(() => {});
+    fetch("/api/youtube/status").then(async (r) => { const d = await r.json().catch(() => null); setYt(d && typeof d.configured === "boolean" ? { ...d, checked: true } : { configured: false, connected: false, channelTitle: null, channelId: null, checked: true, error: `Status check failed (HTTP ${r.status}). Reload the page.` }); }).catch(() => setYt({ configured: false, connected: false, channelTitle: null, channelId: null, checked: true, error: "Couldn't reach the server. Reload the page." }));
     loadVideos();
     const flag = new URLSearchParams(window.location.search).get("yt");
     if (flag === "connected") say("YouTube connected — uploads are armed.");
-    if (flag === "error") say("YouTube connection failed.");
+    if (flag === "error") say(`YouTube connection failed${new URLSearchParams(window.location.search).get("ytmsg") ? `: ${new URLSearchParams(window.location.search).get("ytmsg")}` : "."}`);
     if (flag === "unconfigured") say("Add GOOGLE_CLIENT_ID / SECRET to env first.");
   }, [loadVideos]);
 

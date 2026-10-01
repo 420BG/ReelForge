@@ -468,7 +468,20 @@ export function YouTubeCard({ yt, onChange, say }: { yt: YtStatus; onChange: (s:
         <YouTubeIcon className="h-5 w-5 text-red-400" /> YouTube
       </h2>
 
-      {!yt.configured && (
+      {yt.checked === false || yt.checked === undefined ? (
+        <p className="mt-4 text-xs text-dim">Checking connection…</p>
+      ) : null}
+
+      {yt.checked && yt.error && (
+        <div className="mt-4 rounded-2xl border border-red-400/25 bg-red-400/[0.06] p-4">
+          <p className="flex items-center gap-2 text-xs font-bold text-red-300">
+            <AlertTriangle className="h-3.5 w-3.5" /> {yt.configured ? "Keys found, but the YouTube status check failed" : "Couldn't check YouTube status"}
+          </p>
+          <p className="mt-2 break-words text-[11px] leading-relaxed text-mute">{yt.error}</p>
+        </div>
+      )}
+
+      {yt.checked && !yt.configured && !yt.error && (
         <div className="mt-4 rounded-2xl border border-amber-400/25 bg-amber-400/[0.06] p-4">
           <p className="flex items-center gap-2 text-xs font-bold text-amber-300">
             <AlertTriangle className="h-3.5 w-3.5" /> OAuth keys not in environment
@@ -482,7 +495,7 @@ export function YouTubeCard({ yt, onChange, say }: { yt: YtStatus; onChange: (s:
         </div>
       )}
 
-      {yt.configured && !yt.connected && (
+      {yt.checked && yt.configured && !yt.connected && (
         <a
           href="/api/youtube/auth"
           className="btn-sheen mt-4 flex h-12 items-center justify-center gap-2 rounded-2xl bg-red-500 text-sm font-bold text-white transition hover:brightness-110"

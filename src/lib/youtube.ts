@@ -1,6 +1,26 @@
 import { db } from "@/db";
 import { youtubeAccounts, type YouTubeAccountRow } from "@/db/schema";
 import { eq } from "drizzle-orm";
+import { pool } from "@/db";
+
+/* ADDITIVE ONLY: the YouTube table was originally created by `drizzle-kit push`, which never ran
+   on some databases (e.g. a fresh Supabase). Create it if missing — never drops or alters anything. */
+const globalForYt = globalThis as typeof globalThis & { __ytTableReady?: Promise<void> };
+export function ensureYouTubeTable(): Promise<void> {
+  if (!globalForYt.__ytTableReady) {
+    globalForYt.__ytTableReady = pool.query(`
+      CREATE TABLE IF NOT EXISTS youtube_accounts (
+        id serial PRIMARY KEY,
+        channel_title text,
+        channel_id text,
+        access_token text,
+        refresh_token text,
+        expiry_date text,
+        updated_at timestamptz NOT NULL DEFAULT now()
+      );`).then(() => undefined).catch((error) => { globalForYt.__ytTableReady = undefined; throw error; });
+  }
+  return globalForYt.__ytTableReady;
+}
 
 /* Hand-rolled YouTube Data API v3 OAuth + upload helpers (no SDK needed). */
 
@@ -62,6 +82,7 @@ export async function exchangeCode(code: string): Promise<void> {
     /* channel lookup is cosmetic — tokens matter */
   }
 
+  await ensureYouTubeTable();
   const existing = await db.select().from(youtubeAccounts).limit(1);
   const values = {
     channelTitle,
@@ -82,11 +103,13 @@ export async function exchangeCode(code: string): Promise<void> {
 }
 
 export async function getAccount(): Promise<YouTubeAccountRow | null> {
+  await ensureYouTubeTable();
   const rows = await db.select().from(youtubeAccounts).limit(1);
   return rows[0] ?? null;
 }
 
 export async function disconnectYouTube(): Promise<void> {
+  await ensureYouTubeTable();
   await db.delete(youtubeAccounts);
 }
 

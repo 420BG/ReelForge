@@ -114,7 +114,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     fetch("/api/series").then((r) => r.json()).then((d) => setSeries(d.items)).catch(() => {});
     fetch("/api/providers").then((r) => r.json()).then((d) => setProviders(d.items)).catch(() => {});
-    fetch("/api/youtube/status").then((r) => r.json()).then(setYt).catch(() => {});
+    fetch("/api/youtube/status").then(async (r) => { const d = await r.json().catch(() => null); setYt(d && typeof d.configured === "boolean" ? { ...d, checked: true } : { configured: false, connected: false, channelTitle: null, channelId: null, checked: true, error: `Status check failed (HTTP ${r.status}). Reload the page.` }); }).catch(() => setYt({ configured: false, connected: false, channelTitle: null, channelId: null, checked: true, error: "Couldn't reach the server. Reload the page." }));
     fetch("/api/settings")
       .then((r) => (r.ok ? r.json() : null))
       .then((d) => {
@@ -125,7 +125,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     loadVideos();
     const flag = new URLSearchParams(window.location.search).get("yt");
     if (flag === "connected") say("YouTube connected — uploads are armed.");
-    if (flag === "error") say("YouTube connection failed.");
+    if (flag === "error") say(`YouTube connection failed${new URLSearchParams(window.location.search).get("ytmsg") ? `: ${new URLSearchParams(window.location.search).get("ytmsg")}` : "."}`);
     if (flag === "unconfigured") say("Add GOOGLE_CLIENT_ID / SECRET to env first.");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
