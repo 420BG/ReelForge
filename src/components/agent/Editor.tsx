@@ -69,6 +69,7 @@ export default function Editor({ id }: { id: string }) {
   }, [draft]);
 
   async function act(action: string, extra: Record<string, unknown> = {}, success = "Done.") {
+    if (action === "regenerate-scene" && !(await saveIfDirty())) return; // unsaved edits are saved first, not blocked
     setBusy(action);
     try {
       const data = await api<{ video: AgentVideo; url?: string }>(`/api/agent/videos/${id}/action`, post({ action, ...extra }));
@@ -89,8 +90,14 @@ export default function Editor({ id }: { id: string }) {
     finally { setBusy(null); }
   }
   /** Sends a file in small chunks, then the server fits/trims/levels it into the scene. */
+  /** Saves any text/setting edits you haven't saved yet, so uploads and removals never get blocked by them. */
+  async function saveIfDirty() {
+    if (dirty === "story") return patch({ story: draft }, "Your edits were saved.");
+    if (dirty === "settings") return patch({ settings }, "Your settings were saved.");
+    return true;
+  }
   async function upload(kind: "clip" | "voice" | "narration", scene: number, file: File) {
-    if (dirty) { notify("Save your changes first, then upload.", "error"); return; }
+    if (!(await saveIfDirty())) return;
     const key = `${kind}-${scene}`;
     const controller = new AbortController();
     uploadAbort.current = controller;
@@ -132,7 +139,7 @@ export default function Editor({ id }: { id: string }) {
     void uploadAction("remove", { kind, scene });
   }
   async function uploadAction(action: "remove" | "subtitle", extra: Record<string, unknown>) {
-    if (dirty) { notify("Save your changes first.", "error"); return; }
+    if (!(await saveIfDirty())) return;
     setBusy(action);
     try {
       const done = await api<{ video: AgentVideo; note: string }>(`/api/agent/videos/${id}/upload`, post({ action, ...extra }));
@@ -175,6 +182,14 @@ export default function Editor({ id }: { id: string }) {
         <div className="flex items-center gap-2"><ModeBadge video={video} /><StatusPill workflow={video.workflow} /></div>
       </div>
 
+      {dirty && (
+        <div className="fixed inset-x-0 bottom-24 z-40 flex justify-center px-4 lg:bottom-6">
+          <div className="flex items-center gap-3 rounded-2xl border border-lime/40 bg-ink/95 px-4 py-2.5 shadow-[0_8px_30px_rgba(0,0,0,0.5)] backdrop-blur">
+            <span className="text-xs font-semibold text-cream">You have unsaved edits</span>
+            <Button onClick={() => void saveIfDirty()} busy={busy === "save"} disabled={busy !== null} className="h-9 text-xs"><Save className="h-3.5 w-3.5" /> Save changes</Button>
+          </div>
+        </div>
+      )}
       <div className="grid gap-5 lg:grid-cols-[360px_1fr]">
         {/* preview */}
         <div className="space-y-3">
@@ -314,7 +329,7 @@ export default function Editor({ id }: { id: string }) {
                         <div className="flex flex-wrap items-center gap-2">
                           {editable && <FilePick accept={CLIP_ACCEPT} disabled={uploading !== null || busy !== null} busy={upClip} onPick={(file) => void upload("clip", scene.index, file)}>{upClip ? `Uploading ${uploading!.pct}%` : clipMine ? "Replace my clip / image" : "Upload my clip / image"}</FilePick>}
                           {upClip && uploading!.pct < 94 && <button type="button" onClick={() => uploadAbort.current?.abort()} className="inline-flex h-8 items-center gap-1 rounded-xl border border-red-400/40 px-2.5 text-[11px] font-bold text-red-300 hover:bg-red-400/10"><X className="h-3.5 w-3.5" /> Cancel</button>}
-                          {!running && editable && !clipMine && <Button variant="outline" disabled={busy !== null || dirty !== null} onClick={() => void act("regenerate-scene", { scene: scene.index }, `Regenerating scene ${scene.index + 1}.`)} className="h-8 text-[11px]"><RotateCcw className="h-3 w-3" /> Regenerate with AI</Button>}
+                          {!running && editable && !clipMine && <Button variant="outline" disabled={busy !== null || uploading !== null} onClick={() => void act("regenerate-scene", { scene: scene.index }, `Regenerating scene ${scene.index + 1}.`)} className="h-8 text-[11px]"><RotateCcw className="h-3 w-3" /> Regenerate with AI</Button>}
                         </div>
                       </div>
                       {/* voice: your own recording, or AI */}
@@ -326,7 +341,7 @@ export default function Editor({ id }: { id: string }) {
                           {editable && voiceMine && <Button variant="outline" disabled={busy !== null || uploading !== null} onClick={() => void uploadAction("subtitle", { scene: scene.index })} className="h-8 text-[11px]"><PenLine className="h-3 w-3" /> Auto-subtitle</Button>}
                           {upVoice && uploading!.pct < 94 && <button type="button" onClick={() => uploadAbort.current?.abort()} className="inline-flex h-8 items-center gap-1 rounded-xl border border-red-400/40 px-2.5 text-[11px] font-bold text-red-300 hover:bg-red-400/10"><X className="h-3.5 w-3.5" /> Cancel</button>}
                           {editable && voiceMine && <RemoveX label={`Remove your recording from scene ${scene.index + 1}`} disabled={busy !== null || uploading !== null} onClick={() => removeUpload("voice", scene.index, `Remove your recording from scene ${scene.index + 1}? You can upload another one, or the AI voice reads the text on the next render.`)} />}
-                          {!running && editable && !voiceMine && !clipMine && <Button variant="ghost" disabled={busy !== null || dirty !== null} onClick={() => void act("regenerate-scene", { scene: scene.index, voice: true }, `Regenerating scene ${scene.index + 1} + voice.`)} className="h-8 text-[11px]">Regenerate picture + voice</Button>}
+                          {!running && editable && !voiceMine && !clipMine && <Button variant="ghost" disabled={busy !== null || uploading !== null} onClick={() => void act("regenerate-scene", { scene: scene.index, voice: true }, `Regenerating scene ${scene.index + 1} + voice.`)} className="h-8 text-[11px]">Regenerate picture + voice</Button>}
                         </div>
                       </div>
                     </div>
