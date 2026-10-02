@@ -117,11 +117,12 @@ export function StatusPill({ workflow }: { workflow: Workflow }) {
   return <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-bold ${w.cls}`}>{workflow === "processing" && <Loader2 className="h-2.5 w-2.5 animate-spin" />}{w.label}</span>;
 }
 
-export function ModeBadge({ video }: { video: Pick<AgentVideo, "renderMode"> }) {
+export function ModeBadge({ video }: { video: Pick<AgentVideo, "renderMode"> & { warnings?: string[] } }) {
   if (!video.renderMode) return null;
   if (video.renderMode === "video") return <span className="rounded-md bg-lime px-1.5 py-0.5 text-[9px] font-black tracking-wide text-void">AI VIDEO</span>;
   if (video.renderMode === "stock") return <span className="rounded-md bg-sky-300 px-1.5 py-0.5 text-[9px] font-black tracking-wide text-void">STOCK VIDEO</span>;
-  if (video.renderMode === "mixed") return <span className="rounded-md bg-violet-soft px-1.5 py-0.5 text-[9px] font-black tracking-wide text-void">AI IMAGES + VIDEO</span>;
+  if (video.renderMode === "upload") return <span className="rounded-md bg-cream px-1.5 py-0.5 text-[9px] font-black tracking-wide text-void">YOUR MEDIA</span>;
+  if (video.renderMode === "mixed") return <span className="rounded-md bg-violet-soft px-1.5 py-0.5 text-[9px] font-black tracking-wide text-void">{video.warnings?.some((w) => w.startsWith("YOUR MEDIA")) ? "YOUR MEDIA + AI" : "AI IMAGES + VIDEO"}</span>;
   return <span className="rounded-md bg-amber-300 px-1.5 py-0.5 text-[9px] font-black tracking-wide text-void">AI IMAGES</span>;
 }
 

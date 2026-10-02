@@ -2,14 +2,26 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { AlertTriangle, ArrowRight, CheckCircle2, Download, Film, Loader2, Play, RotateCcw, Save, Trash2, Upload, Wand2, X } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { AlertTriangle, ArrowRight, AudioLines, CheckCircle2, Download, Film, Image as ImageIcon, Loader2, PenLine, Play, RotateCcw, Save, Trash2, Upload, Wand2, X } from "lucide-react";
 import { aspectOf, type AgentVideo, type PlanScene, type StoryPlan, type VideoSettings } from "@/content/types";
 import { STYLES, VOICES } from "./Create";
 import { api, fileUrl, formatDuration, post, useAgent } from "./data";
 import { Button, Chip, ModeBadge, Panel, Progress, StatusPill, Toggle } from "./ui";
 
 const STEP_LABEL: Record<string, string> = { story: "Writing story", voice: "Narration", clips: "Generating video clips", audio: "Audio design", segments: "Rendering scenes", compose: "Final mix", validate: "Validating", publish: "Publishing", done: "Done" };
+
+/** A button that opens the phone/computer file picker. */
+function FilePick({ accept, onPick, disabled, busy, children, className = "" }: { accept: string; onPick: (file: File) => void; disabled?: boolean; busy?: boolean; children: ReactNode; className?: string }) {
+  return (
+    <label className={`inline-flex h-8 cursor-pointer items-center justify-center gap-1.5 rounded-xl border border-white/12 px-3 text-[11px] font-bold text-cream transition hover:border-lime/40 ${disabled ? "pointer-events-none opacity-50" : ""} ${className}`}>
+      {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : null}{children}
+      <input type="file" accept={accept} disabled={disabled} className="hidden" onChange={(e) => { const file = e.target.files?.[0]; e.target.value = ""; if (file) onPick(file); }} />
+    </label>
+  );
+}
+const CLIP_ACCEPT = "video/mp4,video/quicktime,video/webm,image/jpeg,image/png,image/webp";
+const AUDIO_ACCEPT = "audio/*,.mp3,.m4a,.wav,.aac,.ogg";
 
 export default function Editor({ id }: { id: string }) {
   const router = useRouter();
@@ -21,6 +33,8 @@ export default function Editor({ id }: { id: string }) {
   const [tab, setTab] = useState<"script" | "scenes" | "settings" | "log">("scenes");
   const [busy, setBusy] = useState<string | null>(null);
   const [missing, setMissing] = useState(false);
+  const [uploading, setUploading] = useState<{ key: string; pct: number } | null>(null);
+  const [autoSubtitle, setAutoSubtitle] = useState(true);
 
   const load = useCallback(async () => {
     try {
@@ -62,6 +76,41 @@ export default function Editor({ id }: { id: string }) {
       notify(data.changed.length ? `${success} Changed scenes will regenerate when you render.` : success);
       return true;
     } catch (error) { notify(error instanceof Error ? error.message : "Save failed.", "error"); return false; }
+    finally { setBusy(null); }
+  }
+  /** Sends a file in small chunks, then the server fits/trims/levels it into the scene. */
+  async function upload(kind: "clip" | "voice" | "narration", scene: number, file: File) {
+    if (dirty) { notify("Save your changes first, then upload.", "error"); return; }
+    const key = `${kind}-${scene}`;
+    setUploading({ key, pct: 0 });
+    try {
+      const start = await api<{ token: string; chunkSize: number; chunks: number }>(`/api/agent/videos/${id}/upload`, post({ action: "start", kind, scene, name: file.name, size: file.size, type: file.type }));
+      for (let i = 0; i < start.chunks; i++) {
+        const part = file.slice(i * start.chunkSize, (i + 1) * start.chunkSize);
+        for (let attempt = 1; ; attempt++) {
+          const response = await fetch(`/api/agent/videos/${id}/upload?token=${start.token}&chunk=${i}`, { method: "PUT", headers: { "Content-Type": "application/octet-stream" }, body: part }).catch(() => null);
+          if (response?.ok) break;
+          if (attempt >= 3) throw new Error(((await response?.json().catch(() => ({}))) as { error?: string } | undefined)?.error ?? "Upload interrupted — check your connection and try again.");
+          await new Promise((resolve) => setTimeout(resolve, 1200 * attempt));
+        }
+        setUploading({ key, pct: Math.round(((i + 1) / start.chunks) * 88) });
+      }
+      setUploading({ key, pct: 94 });
+      const done = await api<{ video: AgentVideo; note: string }>(`/api/agent/videos/${id}/upload`, post({ action: "finish", token: start.token, chunks: start.chunks, name: file.name, type: file.type, subtitle: autoSubtitle }));
+      setVideo(done.video); setDraft(done.video.story); setSettings(done.video.settings);
+      notify(done.note || "Uploaded.");
+      void refresh(true);
+    } catch (error) { notify(error instanceof Error ? error.message : "Upload failed.", "error"); }
+    finally { setUploading(null); }
+  }
+  async function uploadAction(action: "remove" | "subtitle", extra: Record<string, unknown>) {
+    if (dirty) { notify("Save your changes first.", "error"); return; }
+    setBusy(action);
+    try {
+      const done = await api<{ video: AgentVideo; note: string }>(`/api/agent/videos/${id}/upload`, post({ action, ...extra }));
+      setVideo(done.video); setDraft(done.video.story);
+      notify(done.note || "Done.");
+    } catch (error) { notify(error instanceof Error ? error.message : "Action failed.", "error"); }
     finally { setBusy(null); }
   }
   async function render() {
@@ -176,10 +225,27 @@ export default function Editor({ id }: { id: string }) {
 
             {draft && tab === "scenes" && (
               <div className="space-y-3">
+                {video.workflow !== "published" && (
+                  <div className="rounded-2xl border border-lime/20 bg-lime/[0.04] p-3">
+                    <p className="font-display text-sm font-bold">Use your own media</p>
+                    <p className="mt-1 text-[11px] leading-relaxed text-mute">On any scene, upload your own clip, image or voice — handy when the free AI is busy. Everything is adjusted for you: clips are cropped to the frame and fitted to the narration, images get camera motion, recordings are trimmed and levelled, and each scene&apos;s length follows your voice. Then press <b className="text-cream">{video.hasFinal ? "Re-render video" : "Render video"}</b>.</p>
+                    <div className="mt-2 flex flex-wrap items-center gap-2">
+                      <FilePick accept={AUDIO_ACCEPT} disabled={uploading !== null || busy !== null} busy={uploading?.key === "narration-0"} onPick={(file) => void upload("narration", 0, file)} className="h-9 border-lime/40">{uploading?.key === "narration-0" ? `Uploading ${uploading.pct}%` : <><AudioLines className="h-3.5 w-3.5" /> Upload full narration (one file for the whole video)</>}</FilePick>
+                      <label className="flex items-center gap-1.5 text-[11px] text-dim"><input type="checkbox" checked={autoSubtitle} onChange={(e) => setAutoSubtitle(e.target.checked)} className="accent-lime" /> Write subtitles from my audio</label>
+                    </div>
+                    <p className="mt-1.5 text-[10px] text-dim">A full narration is cut into one piece per scene at natural pauses. Limits: clip 120 MB (first 60 s used), voice 40 MB, full narration 80 MB.</p>
+                    {uploading && <div className="mt-2"><Progress value={uploading.pct} /><p className="mt-1 text-[10px] text-dim">{uploading.pct < 90 ? "Uploading…" : "Adjusting your file (fit, trim, level)…"} keep this page open.</p></div>}
+                  </div>
+                )}
                 {draft.scenes.map((scene) => {
                   const assets = assetsFor(scene.index);
                   const clip = assets.find((a) => a.kind === "clip");
                   const voice = assets.find((a) => a.kind === "voice");
+                  const clipMine = clip?.status === "done" && clip.provider === "upload";
+                  const voiceMine = voice?.status === "done" && voice.provider === "upload";
+                  const editable = video.workflow !== "published";
+                  const upClip = uploading?.key === `clip-${scene.index}`;
+                  const upVoice = uploading?.key === `voice-${scene.index}`;
                   return (
                     <div key={scene.index} id={`scene-${scene.index}`} className="rounded-2xl border border-white/[0.07] bg-white/[0.02] p-3">
                       <div className="mb-2 flex flex-wrap items-center gap-1.5 text-[10px]">
@@ -187,19 +253,32 @@ export default function Editor({ id }: { id: string }) {
                         <span className="rounded bg-white/[0.06] px-1.5 py-0.5 text-mute">{scene.beat}</span>
                         <span className="rounded bg-white/[0.06] px-1.5 py-0.5 text-mute">{scene.camera}</span>
                         {scene.atmosphere.map((fx) => <span key={fx} className="rounded bg-white/[0.06] px-1.5 py-0.5 text-mute">{fx}</span>)}
-                        <span className="ml-auto text-dim">{clip?.status === "done" ? (clip.mode === "image" ? "IMAGE MODE" : `AI video · ${clip.provider}`) : clip?.status ?? "pending"}</span>
+                        <span className={`ml-auto ${clipMine ? "font-bold text-lime" : "text-dim"}`}>{clip?.status === "done" ? (clipMine ? (clip.mode === "image" ? "YOUR IMAGE" : "YOUR CLIP") : clip.mode === "image" ? "AI IMAGE" : `AI video · ${clip.provider}`) : clip?.status ?? "pending"}</span>
                       </div>
                       {clip?.status === "failed" && clip.error && <p className="mb-2 text-[11px] text-red-300">{clip.error}</p>}
-                      <label className="block text-[11px] text-dim">Narration<textarea rows={2} value={scene.narration} onChange={(e) => editScene(scene.index, "narration", e.target.value)} className="mt-1 w-full rounded-xl border border-white/10 bg-void/60 p-2 text-sm text-cream outline-none focus:border-lime/50" /></label>
+                      <label className="block text-[11px] text-dim">{voiceMine ? "Subtitle text (your recording is the voice — this only changes the words on screen)" : "Narration (spoken by the AI voice and shown as the subtitle)"}<textarea rows={2} value={scene.narration} onChange={(e) => editScene(scene.index, "narration", e.target.value)} className="mt-1 w-full rounded-xl border border-white/10 bg-void/60 p-2 text-sm text-cream outline-none focus:border-lime/50" /></label>
                       <label className="mt-2 block text-[11px] text-dim">Visual<textarea rows={2} value={scene.visual} onChange={(e) => editScene(scene.index, "visual", e.target.value)} className="mt-1 w-full rounded-xl border border-white/10 bg-void/60 p-2 text-sm text-cream outline-none focus:border-lime/50" /></label>
                       <label className="mt-2 block text-[11px] text-dim">Animation<input value={scene.animation} onChange={(e) => editScene(scene.index, "animation", e.target.value)} className="mt-1 h-9 w-full rounded-xl border border-white/10 bg-void/60 px-2 text-sm text-cream outline-none focus:border-lime/50" /></label>
                       <p className="mt-2 text-[11px] text-dim">SFX: {scene.sfx.join(", ") || "—"} · Transition: {scene.transition}</p>
-                      <div className="mt-2 flex flex-wrap items-center gap-2">
-                        {voice?.status === "done" && <audio controls preload="none" src={fileUrl(video.id, "voice", `&scene=${scene.index}&v=${encodeURIComponent(voice.updatedAt)}`)} className="h-8 max-w-[220px]" />}
-                        {!running && video.workflow !== "published" && <>
-                          <Button variant="outline" disabled={busy !== null || dirty !== null} onClick={() => void act("regenerate-scene", { scene: scene.index }, `Regenerating scene ${scene.index + 1}.`)} className="h-8 text-[11px]"><RotateCcw className="h-3 w-3" /> Regenerate clip</Button>
-                          <Button variant="ghost" disabled={busy !== null || dirty !== null} onClick={() => void act("regenerate-scene", { scene: scene.index, voice: true }, `Regenerating scene ${scene.index + 1} + voice.`)} className="h-8 text-[11px]">Clip + voice</Button>
-                        </>}
+                      {/* picture: your own clip/image, or AI */}
+                      <div className="mt-3 rounded-xl border border-white/[0.06] bg-void/40 p-2.5">
+                        <p className="mb-2 flex items-center gap-1.5 text-[11px] font-semibold text-mute"><ImageIcon className="h-3.5 w-3.5" /> Picture {clipMine && <span className="rounded bg-lime/15 px-1.5 py-0.5 text-[10px] font-bold text-lime">yours{clip?.meta?.trimmed ? " · first 60s" : ""}</span>}</p>
+                        <div className="flex flex-wrap items-center gap-2">
+                          {editable && <FilePick accept={CLIP_ACCEPT} disabled={uploading !== null || busy !== null} busy={upClip} onPick={(file) => void upload("clip", scene.index, file)}>{upClip ? `Uploading ${uploading!.pct}%` : clipMine ? "Replace my clip / image" : "Upload my clip / image"}</FilePick>}
+                          {editable && clipMine && <Button variant="ghost" disabled={busy !== null || uploading !== null} onClick={() => void uploadAction("remove", { kind: "clip", scene: scene.index })} className="h-8 text-[11px]">Use AI instead</Button>}
+                          {!running && editable && !clipMine && <Button variant="outline" disabled={busy !== null || dirty !== null} onClick={() => void act("regenerate-scene", { scene: scene.index }, `Regenerating scene ${scene.index + 1}.`)} className="h-8 text-[11px]"><RotateCcw className="h-3 w-3" /> Regenerate with AI</Button>}
+                        </div>
+                      </div>
+                      {/* voice: your own recording, or AI */}
+                      <div className="mt-2 rounded-xl border border-white/[0.06] bg-void/40 p-2.5">
+                        <p className="mb-2 flex items-center gap-1.5 text-[11px] font-semibold text-mute"><AudioLines className="h-3.5 w-3.5" /> Voice {voiceMine && <span className="rounded bg-lime/15 px-1.5 py-0.5 text-[10px] font-bold text-lime">yours · {Number(voice?.meta?.duration ?? 0).toFixed(1)}s</span>}</p>
+                        <div className="flex flex-wrap items-center gap-2">
+                          {voice?.status === "done" && <audio controls preload="none" src={fileUrl(video.id, "voice", `&scene=${scene.index}&v=${encodeURIComponent(voice.updatedAt)}`)} className="h-8 max-w-[220px]" />}
+                          {editable && <FilePick accept={AUDIO_ACCEPT} disabled={uploading !== null || busy !== null} busy={upVoice} onPick={(file) => void upload("voice", scene.index, file)}>{upVoice ? `Uploading ${uploading!.pct}%` : voiceMine ? "Replace my recording" : "Upload my voice"}</FilePick>}
+                          {editable && voiceMine && <Button variant="outline" disabled={busy !== null || uploading !== null} onClick={() => void uploadAction("subtitle", { scene: scene.index })} className="h-8 text-[11px]"><PenLine className="h-3 w-3" /> Auto-subtitle</Button>}
+                          {editable && voiceMine && <Button variant="ghost" disabled={busy !== null || uploading !== null} onClick={() => void uploadAction("remove", { kind: "voice", scene: scene.index })} className="h-8 text-[11px]">Use AI voice</Button>}
+                          {!running && editable && !voiceMine && !clipMine && <Button variant="ghost" disabled={busy !== null || dirty !== null} onClick={() => void act("regenerate-scene", { scene: scene.index, voice: true }, `Regenerating scene ${scene.index + 1} + voice.`)} className="h-8 text-[11px]">Regenerate picture + voice</Button>}
+                        </div>
                       </div>
                     </div>
                   );
@@ -233,7 +312,16 @@ export default function Editor({ id }: { id: string }) {
                   <div className="flex items-center justify-between px-4 py-3"><span>Caption style</span><div className="flex gap-1.5">{(["pop", "karaoke", "fade"] as const).map((a) => <Chip key={a} on={settings.captions.animation === a} onClick={() => editSettings({ ...settings, captions: { ...settings.captions, animation: a } })}>{a}</Chip>)}</div></div>
                   <div className="flex items-center justify-between px-4 py-3"><span>Caption position</span><div className="flex gap-1.5">{(["top", "center", "bottom"] as const).map((p) => <Chip key={p} on={settings.captions.position === p} onClick={() => editSettings({ ...settings, captions: { ...settings.captions, position: p } })}>{p}</Chip>)}</div></div>
                 </div>
-                {needsRecompose && <p className="text-[11px] text-dim">Captions, music and SFX changes apply on “Re-render video” without generating new AI clips.</p>}
+                <div className="rounded-2xl border border-white/[0.07] p-4 text-sm">
+                  <p className="mb-3 flex items-center gap-1.5 text-xs font-semibold text-mute"><PenLine className="h-3.5 w-3.5" /> Subtitle look</p>
+                  <label className="flex items-center justify-between gap-3"><span>Size <span className="text-dim">({settings.captions.size})</span></span><input type="range" min={48} max={140} step={2} value={settings.captions.size} onChange={(e) => editSettings({ ...settings, captions: { ...settings.captions, size: Number(e.target.value) } })} className="w-44 accent-lime" /></label>
+                  <div className="mt-3 flex items-center justify-between gap-3"><span>Text colour</span><input type="color" value={settings.captions.color} onChange={(e) => editSettings({ ...settings, captions: { ...settings.captions, color: e.target.value } })} className="h-8 w-14 rounded border border-white/15 bg-transparent" /></div>
+                  <div className="mt-3 flex items-center justify-between gap-3"><span>Highlight colour <span className="text-dim">(current word)</span></span><input type="color" value={settings.captions.highlight} onChange={(e) => editSettings({ ...settings, captions: { ...settings.captions, highlight: e.target.value } })} className="h-8 w-14 rounded border border-white/15 bg-transparent" /></div>
+                  <div className="mt-3 flex items-center justify-between gap-3"><span>Big hook title at the start</span><Toggle on={settings.captions.hookTitle} onChange={(on) => editSettings({ ...settings, captions: { ...settings.captions, hookTitle: on } })} /></div>
+                  <div className="mt-3 flex items-center justify-between gap-3"><span>Music volume <span className="text-dim">({settings.musicVolume}%)</span></span><input type="range" min={0} max={100} step={5} value={settings.musicVolume} onChange={(e) => editSettings({ ...settings, musicVolume: Number(e.target.value) })} className="w-44 accent-lime" /></div>
+                  <p className="mt-3 text-[11px] text-dim">To change the words, edit a scene&apos;s text in the Scenes tab. Subtitles are timed to the voice automatically.</p>
+                </div>
+                {needsRecompose && <p className="text-[11px] text-dim">Subtitle, music and SFX changes apply on “Re-render video” without generating new AI clips.</p>}
               </div>
             )}
 

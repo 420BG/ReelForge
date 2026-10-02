@@ -58,19 +58,21 @@ export async function POST(request: Request, context: Context) {
       case "regenerate-scene": {
         const index = Number(body.scene);
         if (!story || !Number.isInteger(index) || index < 0 || index >= story.scenes.length) return Response.json({ error: "Invalid scene." }, { status: 400 });
-        await resetAssets(id, [index], body.voice ? ["clip", "keyframe", "voice"] : ["clip", "keyframe"]);
+        await resetAssets(id, [index], body.voice ? ["clip", "keyframe", "voice"] : ["clip", "keyframe"], true); // explicit "regenerate with AI" also replaces an upload
         await start(body.voice ? "voice" : "clips", `Regenerating scene ${index + 1}${body.voice ? " (visual + voice)" : ""}.`);
         break;
       }
       case "rewrite-story":
         if (await activeJobFor(id)) throw new Error("A job for this video is already running.");
-        if (story) await resetAssets(id, story.scenes.map((scene) => scene.index), ["clip", "keyframe", "voice", "story", "part"]);
+        if (story) await resetAssets(id, story.scenes.map((scene) => scene.index), ["clip", "keyframe", "voice", "story", "part"], true);
         await updateVideo(id, { story: null, title: "", hook: null, final_path: null, cover_path: null, render_mode: null });
         await start("story", "Rewriting story from scratch.");
         break;
       case "recompose":
         if (!story) return Response.json({ error: "No story yet." }, { status: 400 });
-        await start("segments", "Recomposing from existing clips (unchanged scenes are reused).");
+        // Start at "voice": finished scenes are skipped in a moment, and anything you edited, removed or
+        // replaced since the last render (narration text, a clip, a recording) is made before the edit.
+        await start(storyComplete(story) ? "voice" : "story", "Re-rendering (unchanged scenes and your uploads are reused).");
         break;
       case "cancel":
         await cancelJobs(id);

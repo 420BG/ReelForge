@@ -51,6 +51,18 @@ export function runFfmpeg(args: string[], timeoutMs = 10 * 60_000, cwd?: string)
   });
 }
 
+/** Runs ffmpeg at info log level and returns its stderr (for analysis filters such as silencedetect). */
+export function ffmpegReport(args: string[], timeoutMs = 120_000): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(FFMPEG(), ["-hide_banner", "-nostats", "-loglevel", "info", "-y", ...args], { stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => { stderr = (stderr + chunk.toString()).slice(-2_000_000); });
+    const timer = setTimeout(() => { child.kill("SIGKILL"); reject(new FfmpegError("ffmpeg timed out", stderr.slice(-2000))); }, timeoutMs);
+    child.on("error", (error) => { clearTimeout(timer); reject(new FfmpegError(error.message, stderr.slice(-2000))); });
+    child.on("close", (code) => { clearTimeout(timer); if (code === 0) resolve(stderr); else reject(new FfmpegError(`ffmpeg exited with code ${code}`, stderr.slice(-2000))); });
+  });
+}
+
 export type ProbeResult = { duration: number; width: number | null; height: number | null; videoCodec: string | null; audioCodec: string | null; hasVideo: boolean; hasAudio: boolean };
 
 function probeWithFfprobe(file: string): Promise<ProbeResult> {
@@ -172,7 +184,7 @@ export async function captionFonts(fontsDir: string) {
     const files: string[] = [];
     if (process.env.AGENT_FONT_FILE) files.push(process.env.AGENT_FONT_FILE);
     for (const file of FONT_CANDIDATES) {
-      try { if ((await stat(file)).isFile()) files.push(file); } catch { /* missing */ }
+      try { if ((await stat(/*turbopackIgnore: true*/ file)).isFile()) files.push(file); } catch { /* missing */ }
     }
     if (!files.length) { const nix = await findNixFont(); if (nix) files.push(nix); }
     if (!files.length) throw new Error("No font found for captions. Keep assets/fonts/DejaVuSans-Bold.ttf in the repo or set AGENT_FONT_FILE.");

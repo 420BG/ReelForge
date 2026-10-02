@@ -59,18 +59,28 @@ export async function publishAgentVideo(videoId: string, opts: { requireApproved
   const renderMode = String(row.render_mode ?? "video");
   const warnings = Array.isArray(row.warnings) ? (row.warnings as string[]) : [];
   const stockNote = warnings.find((w) => w.startsWith("STOCK VIDEO"))?.match(/Credits: (.*)\.$/)?.[1];
-  const disclosure = renderMode === "image"
-    ? "Visuals: AI-generated images for every scene, animated with camera motion. Script, narration and music: AI / synthesized."
-    : renderMode === "stock"
-      ? `Visuals: free stock footage${stockNote ? ` by ${stockNote}` : " (Pexels/Pixabay)"}. Script and narration: AI.`
-      : renderMode === "mixed"
-        ? `Visuals: AI-generated images with camera motion and AI image-to-video clips${stockNote ? `, plus stock footage by ${stockNote}` : ""}. Narration: AI voice.`
-        : "Made with AI-generated video, AI voice narration and synthesized music.";
+  // Files the creator uploaded are described as theirs, never as AI.
+  const ownMedia = warnings.find((w) => w.startsWith("YOUR MEDIA"))?.match(/^YOUR MEDIA: (\d+)\/(\d+)/);
+  const ownVoice = warnings.find((w) => w.startsWith("YOUR VOICE"))?.match(/^YOUR VOICE: (\d+)\/(\d+)/);
+  const allOwnVoice = Boolean(ownVoice && ownVoice[1] === ownVoice[2]);
+  const voiceLine = allOwnVoice ? "Narration: recorded by the creator." : ownVoice ? "Narration: partly recorded by the creator, partly AI voice." : "Narration: AI voice.";
+  const disclosure = renderMode === "upload"
+    ? `Visuals: footage and images provided by the creator. ${voiceLine} Music: synthesized.`
+    : ownMedia
+      ? `Visuals: ${ownMedia[1]} of ${ownMedia[2]} scenes are the creator's own footage or images; the rest are AI-generated${stockNote ? ` or stock footage by ${stockNote}` : ""}. ${voiceLine}`
+      : renderMode === "image"
+        ? `Visuals: AI-generated images for every scene, animated with camera motion. Script and music: AI / synthesized. ${voiceLine}`
+        : renderMode === "stock"
+          ? `Visuals: free stock footage${stockNote ? ` by ${stockNote}` : " (Pexels/Pixabay)"}. Script: AI. ${voiceLine}`
+          : renderMode === "mixed"
+            ? `Visuals: AI-generated images with camera motion and AI image-to-video clips${stockNote ? `, plus stock footage by ${stockNote}` : ""}. ${voiceLine}`
+            : `Made with AI-generated video and synthesized music. ${voiceLine}`;
   const privacy = (["private", "unlisted", "public"].includes(String(row.privacy)) ? row.privacy : "private") as "private" | "unlisted" | "public";
   const metadata = agentUploadMetadata(story.seo, row.audience === "kids" ? "kids" : "general", privacy, disclosure, isYouTubeShort({ ...(row.settings as VideoSettings), aspect: story.aspect ?? (row.settings as VideoSettings | null)?.aspect }, Number(row.duration_sec) || null) ? "short" : "long");
   let youtubeId: string;
   try {
-    youtubeId = await resumableUpload(bytes, { ...metadata, status: { ...metadata.status, containsSyntheticMedia: true } });
+    // Altered/synthetic-content flag: on for anything AI-made; off only when both picture and voice are the creator's own.
+    youtubeId = await resumableUpload(bytes, { ...metadata, status: { ...metadata.status, containsSyntheticMedia: !(renderMode === "upload" && allOwnVoice) } });
   } catch (error) {
     // Nothing is uploaded before the session starts, so one retry without the synthetic-media flag is safe.
     if (error instanceof Error && /containsSyntheticMedia|unknown field|invalid.*status/i.test(error.message)) youtubeId = await resumableUpload(bytes, metadata);

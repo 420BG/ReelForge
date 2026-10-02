@@ -401,12 +401,22 @@ export async function upsertAsset(videoId: string, sceneIndex: number, kind: str
 }
 
 /** Marks scene assets for regeneration without touching the others. */
-export async function resetAssets(videoId: string, sceneIndexes: number[], kinds: string[]) {
+/**
+ * Marks assets for regeneration. Files YOU uploaded (provider "upload") are kept unless
+ * `includeUploads` is true — editing a scene's text must never throw away your own clip or recording.
+ */
+export async function resetAssets(videoId: string, sceneIndexes: number[], kinds: string[], includeUploads = false) {
   await q(
-    `UPDATE agent_scene_assets SET status='pending', attempts=0, error=NULL, provider_ref=NULL, next_attempt_at=NULL, updated_at=now()
-     WHERE video_id=$1 AND scene_index = ANY($2::int[]) AND kind = ANY($3::text[])`,
-    [videoId, sceneIndexes, kinds],
+    `UPDATE agent_scene_assets SET status='pending', attempts=0, error=NULL, provider_ref=NULL, next_attempt_at=NULL, updated_at=now(),
+       provider = CASE WHEN provider = 'upload' THEN NULL ELSE provider END
+     WHERE video_id=$1 AND scene_index = ANY($2::int[]) AND kind = ANY($3::text[]) AND ($4::boolean OR provider IS DISTINCT FROM 'upload')`,
+    [videoId, sceneIndexes, kinds, includeUploads],
   );
+}
+
+/** A waiting job (e.g. paused because free AI is out of quota) continues right away — used after you upload a file. */
+export async function wakeJob(videoId: string) {
+  await q("UPDATE agent_jobs SET next_run_at = now() WHERE video_id = $1 AND state IN ('queued','waiting')", [videoId]);
 }
 
 export async function resetFailedAssets(videoId: string) {

@@ -33,6 +33,12 @@ export const storageKey = {
   part: (videoId: string, index: number) => (checkId(videoId), `${videoId}/parts/part-${index}.mp4`),
   final: (videoId: string) => (checkId(videoId), `${videoId}/final.mp4`),
   cover: (videoId: string) => (checkId(videoId), `${videoId}/cover.jpg`),
+  /** One chunk of a file you upload from the editor (kept only until the upload is finished). */
+  uploadChunk: (videoId: string, token: string, index: number) => {
+    checkId(videoId);
+    if (!/^[a-z]+-\d{1,4}-[a-f0-9]{12}$/.test(token)) throw new Error("Invalid upload token.");
+    return `${videoId}/uploads/${token}.part-${String(index).padStart(3, "0")}`;
+  },
 };
 
 const CONTENT_TYPES: Record<string, string> = { mp4: "video/mp4", webm: "video/webm", mov: "video/quicktime", jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", mp3: "audio/mpeg", wav: "audio/wav" };
@@ -118,23 +124,35 @@ async function sbList(prefix: string): Promise<string[]> {
 
 /** Local path of a key on the local backend; null on Supabase. */
 export function localPathFor(key: string) {
-  return storageBackend() === "local" ? path.join(mediaRoot(), key) : null;
+  return storageBackend() === "local" ? path.join(/*turbopackIgnore: true*/ mediaRoot(), key) : null;
 }
 
 /** Stores a local file under `key`. */
 export async function putFile(key: string, localFile: string) {
   if (storageBackend() === "supabase") return sbUpload(key, await readFile(localFile), contentTypeFor(key));
-  const target = path.join(mediaRoot(), key);
-  if (path.resolve(target) === path.resolve(localFile)) return;
+  const target = path.join(/*turbopackIgnore: true*/ mediaRoot(), key);
+  if (path.resolve(/*turbopackIgnore: true*/ target) === path.resolve(/*turbopackIgnore: true*/ localFile)) return;
   await mkdir(path.dirname(target), { recursive: true });
   await copyFile(localFile, target);
 }
 
 export async function putBytes(key: string, bytes: Buffer) {
   if (storageBackend() === "supabase") return sbUpload(key, bytes, contentTypeFor(key));
-  const target = path.join(mediaRoot(), key);
+  const target = path.join(/*turbopackIgnore: true*/ mediaRoot(), key);
   await mkdir(path.dirname(target), { recursive: true });
   await writeFile(target, bytes);
+}
+
+/** Deletes stored objects (best effort) — used to clear upload chunks once a file is assembled. */
+export async function removeStored(keys: string[]) {
+  if (!keys.length) return;
+  if (storageBackend() === "supabase") {
+    try {
+      await fetch(`${sbBase()}/object/${encodeURIComponent(bucket())}`, { method: "DELETE", headers: sbHeaders({ "Content-Type": "application/json" }), body: JSON.stringify({ prefixes: keys.map((key) => `${PREFIX}${key}`) }), cache: "no-store" });
+    } catch { /* best effort */ }
+    return;
+  }
+  for (const key of keys) { try { await rm(path.join(/*turbopackIgnore: true*/ mediaRoot(), key), { force: true }); } catch { /* already gone */ } }
 }
 
 /** Returns a local file for `key`, downloading into scratch when stored remotely. */
@@ -183,14 +201,14 @@ export async function removeVideoMedia(videoId: string) {
   if (storageBackend() === "supabase") {
     try {
       const keys = [
-        ...(await sbList(`${videoId}/scenes`)), ...(await sbList(`${videoId}/audio`)), ...(await sbList(`${videoId}/segments`)), ...(await sbList(`${videoId}/parts`)), ...(await sbList(videoId)),
+        ...(await sbList(`${videoId}/scenes`)), ...(await sbList(`${videoId}/audio`)), ...(await sbList(`${videoId}/segments`)), ...(await sbList(`${videoId}/parts`)), ...(await sbList(`${videoId}/uploads`)), ...(await sbList(videoId)),
       ];
       if (keys.length) {
         await fetch(`${sbBase()}/object/${encodeURIComponent(bucket())}`, { method: "DELETE", headers: sbHeaders({ "Content-Type": "application/json" }), body: JSON.stringify({ prefixes: keys.map((key) => `${PREFIX}${key}`) }), cache: "no-store" });
       }
     } catch { /* best effort */ }
   } else {
-    try { await rm(path.join(mediaRoot(), videoId), { recursive: true, force: true }); } catch { /* already gone */ }
+    try { await rm(path.join(/*turbopackIgnore: true*/ mediaRoot(), videoId), { recursive: true, force: true }); } catch { /* already gone */ }
   }
   await clearScratch(videoId);
 }

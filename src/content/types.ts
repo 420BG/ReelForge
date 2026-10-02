@@ -6,7 +6,8 @@
 export type Audience = "general" | "kids";
 export type Workflow = "draft" | "processing" | "review" | "approved" | "published" | "failed";
 /** "stock" = free real stock footage (Pexels/Pixabay), NOT AI-generated video. */
-export type RenderMode = "video" | "image" | "stock" | "mixed";
+/** "upload" = every scene uses a clip or image the creator uploaded (nothing AI-generated on screen). */
+export type RenderMode = "video" | "image" | "stock" | "upload" | "mixed";
 
 export type SceneBeat = "hook" | "setup" | "escalation" | "twist" | "payoff" | "ending" | "loop";
 export type CameraMove =

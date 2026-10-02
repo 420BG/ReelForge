@@ -327,8 +327,19 @@ async function audioStep(): Promise<StepOutcome> {
   return { state: "queued", step: "segments", progress: progressFor("audio", 1) };
 }
 
-type PlannedScene = ComposeScene & { clipKey: string; clipStamp: string; voiceKey: string | null; clipMode: string | null };
+type PlannedScene = ComposeScene & { clipKey: string; clipStamp: string; voiceKey: string | null; clipMode: string | null; clipUploaded: boolean; voiceUploaded: boolean };
 type Group = { index: number; scenes: PlannedScene[]; entries: TimelineEntry[]; maxDuration: number };
+
+/**
+ * Longest a Short may run. AI narration is nudged to fit the length you picked; a recording YOU
+ * uploaded is never sped up — the video simply runs as long as your voice does.
+ */
+function shortCap(ctx: Ctx, scenes: PlannedScene[]) {
+  const base = Math.max(ctx.settings.targetDuration + 10, 20);
+  if (!scenes.some((scene) => scene.voiceUploaded)) return base;
+  const spoken = scenes.reduce((sum, scene) => sum + (scene.voiceFile ? scene.voiceDuration : scene.plannedDuration) + 1.2, 0);
+  return Math.max(base, Math.ceil(spoken + 5));
+}
 
 /**
  * Timeline for the whole video. Shorts are one group; long videos get one group per story part
@@ -361,6 +372,8 @@ async function composePlan(ctx: Ctx) {
       clipStamp: `${clip.path}|${new Date(clip.updated_at).getTime()}`,
       voiceKey: voiceOk ? voice!.path : null,
       clipMode: clip.mode,
+      clipUploaded: clip.provider === "upload",
+      voiceUploaded: voiceOk && voice!.provider === "upload",
     });
   }
   const groups: Group[] = [];
@@ -375,7 +388,7 @@ async function composePlan(ctx: Ctx) {
       groups.push({ index, scenes: list, entries: planTimeline(list, maxDuration).entries, maxDuration });
     });
   } else {
-    const maxDuration = Math.max(ctx.settings.targetDuration + 10, 20);
+    const maxDuration = shortCap(ctx, scenes);
     groups.push({ index: 0, scenes, entries: planTimeline(scenes, maxDuration).entries, maxDuration });
   }
   const lengthOf = new Map<number, number>();
@@ -396,7 +409,7 @@ async function segmentsStep(ctx: Ctx): Promise<StepOutcome> {
     const signature = `${scene.clipStamp}|${length.toFixed(3)}|${niche.colorGrade}|${scene.camera}|${scene.atmosphere.join(",")}|${dims.width}x${dims.height}`;
     const existing = segments.get(scene.index);
     if (existing?.status === "done" && existing.meta?.signature === signature && (await storedLooksPresent(existing.path))) continue;
-    await logJob(ctx.job.id, "info", `Editing scene ${i + 1}/${total} (${length.toFixed(1)}s, ${scene.kind === "image" ? `AI image + ${scene.camera} motion` : "AI video"})…`);
+    await logJob(ctx.job.id, "info", `Editing scene ${i + 1}/${total} (${length.toFixed(1)}s, ${scene.clipUploaded ? (scene.kind === "image" ? `your image + ${scene.camera} motion` : "your clip, fitted to the frame") : scene.kind === "image" ? `AI image + ${scene.camera} motion` : "AI video"})…`);
     const source = await materialize(scene.clipKey, ctx.videoId);
     const out = path.join(await ensureScratch(ctx.videoId), `seg-${scene.index}.mp4`);
     await renderSceneSegment({ ...scene, source }, length, niche.colorGrade, out, dims);
@@ -504,17 +517,21 @@ async function composeStep(ctx: Ctx): Promise<StepOutcome> {
     if (hasCover) await putFile(storageKey.cover(ctx.videoId), coverFile);
   }
 
-  const maxDuration = isLong(ctx) ? ctx.settings.targetDuration * 1.6 + 60 : ctx.settings.targetDuration + 10;
+  const anyUploadedVoice = plan.scenes.some((scene) => scene.voiceUploaded);
+  const maxDuration = isLong(ctx) ? (anyUploadedVoice ? Math.max(ctx.settings.targetDuration * 1.6 + 60, duration + 5) : ctx.settings.targetDuration * 1.6 + 60) : Math.max(ctx.settings.targetDuration + 10, plan.groups[0].maxDuration);
   const report = await validateFinal(outFile, { maxDuration, expectAudio: plan.scenes.some((scene) => scene.voiceKey), dims, format: ctx.settings.format });
   if (!report.ok) return { state: "failed", step: "compose", error: `Validation failed: ${report.errors.join(" ")}` };
   await putFile(storageKey.final(ctx.videoId), outFile);
 
-  const modes = new Set(plan.scenes.map((scene) => (scene.clipMode === "stock" ? "stock" : scene.clipMode === "image" ? "image" : "video")));
-  const renderMode = modes.size > 1 ? "mixed" : modes.has("image") ? "image" : modes.has("stock") ? "stock" : "video";
+  // Honest labels: files you uploaded are never counted as AI-generated.
+  const modes = new Set(plan.scenes.map((scene) => (scene.clipUploaded ? "upload" : scene.clipMode === "stock" ? "stock" : scene.clipMode === "image" ? "image" : "video")));
+  const renderMode = modes.size > 1 ? "mixed" : modes.has("upload") ? "upload" : modes.has("image") ? "image" : modes.has("stock") ? "stock" : "video";
+  const uploadedClips = plan.scenes.filter((scene) => scene.clipUploaded).length;
+  const uploadedVoices = plan.scenes.filter((scene) => scene.voiceUploaded).length;
   const stockCredits = Array.from(new Set([...plan.clips.values()].filter((clip) => clip.mode === "stock").map((clip) => `${clip.meta?.credit ?? "unknown"} (${clip.provider === "pixabay" ? "Pixabay" : "Pexels"})`)));
-  const prior = (Array.isArray(ctx.row.warnings) ? (ctx.row.warnings as string[]) : []).filter((w) => !/^Narration sped up|No synthesized sound|Final length|Cover image failed|IMAGE MODE|AI IMAGES|STOCK VIDEO|Duration .* above|No narration/.test(w));
+  const prior = (Array.isArray(ctx.row.warnings) ? (ctx.row.warnings as string[]) : []).filter((w) => !/^Narration sped up|No synthesized sound|Final length|Cover image failed|IMAGE MODE|AI IMAGES|STOCK VIDEO|YOUR MEDIA|YOUR VOICE|Duration .* above|No narration/.test(w));
   const costs = [...plan.clips.values()].map((clip) => Number(clip.meta?.cost)).filter((n) => Number.isFinite(n));
-  const imageScenes = plan.scenes.filter((scene) => scene.clipMode === "image").length;
+  const imageScenes = plan.scenes.filter((scene) => scene.clipMode === "image" && !scene.clipUploaded).length;
   await updateVideo(ctx.videoId, {
     final_path: storageKey.final(ctx.videoId),
     cover_path: hasCover ? storageKey.cover(ctx.videoId) : null,
@@ -524,6 +541,8 @@ async function composeStep(ctx: Ctx): Promise<StepOutcome> {
       ...prior, ...composeWarnings, ...report.warnings,
       ...(imageScenes ? [`AI IMAGES + MOTION: ${imageScenes}/${plan.scenes.length} scenes are AI-generated images animated with camera motion (not AI video clips).`] : []),
       ...(modes.has("stock") ? [`STOCK VIDEO: some scenes are free stock footage, not AI. Credits: ${stockCredits.join(", ")}.`] : []),
+      ...(uploadedClips ? [`YOUR MEDIA: ${uploadedClips}/${plan.scenes.length} scenes use clips or images you uploaded (not AI-generated).`] : []),
+      ...(uploadedVoices ? [`YOUR VOICE: ${uploadedVoices}/${plan.scenes.length} scenes use narration you recorded.`] : []),
     ])).slice(0, 20),
     cost_estimate: costs.length ? Math.round(costs.reduce((sum, n) => sum + n, 0) * 100) / 100 : null,
   });
