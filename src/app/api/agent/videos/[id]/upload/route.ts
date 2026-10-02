@@ -1,7 +1,7 @@
 import type { StoryPlan } from "@/content/types";
 import { fail, guard, UUID } from "@/jobs/api-helpers";
-import { getAssets, getVideo, getVideoRow, resetAssets, updateVideo, wakeJob } from "@/jobs/repo";
-import { clearScratch, materialize } from "@/video/storage";
+import { getAssets, getVideo, getVideoRow, removeUploads, updateVideo, wakeJob } from "@/jobs/repo";
+import { clearScratch, materialize, removeStored, storageKey } from "@/video/storage";
 import {
   assembleUpload, CHUNK_BYTES, classifyUpload, ingestClip, ingestNarration, ingestVoice, MAX_BYTES, newUploadToken, parseUploadToken,
   saveUploadChunk, speechToTextAvailable, transcribe, UPLOAD_PROVIDER, type UploadKind,
@@ -37,7 +37,8 @@ export async function PUT(request: Request, context: Context) {
 /**
  * start     – begin an upload (checks type/size, returns a token and the chunk size)
  * finish    – assemble the chunks and auto-adjust the file into the scene (fit, trim, level, cut)
- * remove    – stop using your upload for a scene (AI makes it again on the next render)
+ * cancel    – throw away a half-finished upload
+ * remove    – delete your upload from a scene, or every upload of one kind (AI makes it again on the next render)
  * subtitle  – write a scene's subtitle text from its recording (speech-to-text)
  */
 export async function POST(request: Request, context: Context) {
@@ -115,11 +116,25 @@ export async function POST(request: Request, context: Context) {
       return Response.json({ video: await getVideo(id), note: notes.join(" ") });
     }
 
+    if (action === "cancel") {
+      // You cancelled mid-upload: delete the parts that already arrived. Nothing in the video changes.
+      const parsed = parseUploadToken(String(body.token ?? ""));
+      const chunks = Math.min(Math.max(0, Number(body.chunks) || 0), 64);
+      if (parsed && chunks) await removeStored(Array.from({ length: chunks }, (_, i) => storageKey.uploadChunk(id, String(body.token), i)));
+      return Response.json({ ok: true });
+    }
+
     if (action === "remove") {
+      // kind: "clip" | "voice" for one scene, or scene "all" to clear every upload of that kind
+      // (e.g. a full narration you uploaded by mistake). Only YOUR uploads are touched — never AI-made files.
       const kind = body.kind === "voice" ? "voice" : body.kind === "clip" ? "clip" : null;
-      if (!kind || !validScene(body.scene)) return Response.json({ error: "Invalid request." }, { status: 400 });
-      await resetAssets(id, [Number(body.scene)], kind === "clip" ? ["clip", "keyframe"] : ["voice"], true);
-      return Response.json({ video: await getVideo(id), note: `Scene ${Number(body.scene) + 1}: your ${kind === "clip" ? "clip" : "recording"} was removed — AI will make it on the next render.` });
+      const everyScene = body.scene === "all";
+      if (!kind || (!everyScene && !validScene(body.scene))) return Response.json({ error: "Invalid request." }, { status: 400 });
+      const removed = await removeUploads(id, kind === "clip" ? ["clip", "keyframe"] : ["voice"], everyScene ? null : [Number(body.scene)]);
+      if (!removed.count) return Response.json({ video: await getVideo(id), note: "Nothing to remove — that isn't one of your uploads." });
+      await removeStored(removed.paths);
+      const what = kind === "clip" ? (removed.count > 1 ? `${removed.count} uploaded clips/images` : "uploaded clip/image") : removed.count > 1 ? `${removed.count} uploaded recordings` : "uploaded recording";
+      return Response.json({ video: await getVideo(id), note: `Removed your ${what}${everyScene ? "" : ` from scene ${Number(body.scene) + 1}`}. Upload another, or leave it and AI makes ${removed.count > 1 ? "them" : "it"} on the next render.` });
     }
 
     if (action === "subtitle") {

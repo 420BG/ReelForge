@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { AlertTriangle, ArrowRight, AudioLines, CheckCircle2, Download, Film, Image as ImageIcon, Loader2, PenLine, Play, RotateCcw, Save, Trash2, Upload, Wand2, X } from "lucide-react";
 import { aspectOf, type AgentVideo, type PlanScene, type StoryPlan, type VideoSettings } from "@/content/types";
 import { STYLES, VOICES } from "./Create";
@@ -20,6 +20,15 @@ function FilePick({ accept, onPick, disabled, busy, children, className = "" }: 
     </label>
   );
 }
+/** Red ✕ that removes one of your uploads (asks first — the file is deleted). */
+function RemoveX({ onClick, disabled, label }: { onClick: () => void; disabled?: boolean; label: string }) {
+  return (
+    <button type="button" onClick={onClick} disabled={disabled} aria-label={label} title={label}
+      className="inline-flex h-8 items-center gap-1 rounded-xl border border-red-400/40 px-2.5 text-[11px] font-bold text-red-300 transition hover:bg-red-400/10 disabled:cursor-not-allowed disabled:opacity-50">
+      <X className="h-3.5 w-3.5" /> Remove
+    </button>
+  );
+}
 const CLIP_ACCEPT = "video/mp4,video/quicktime,video/webm,image/jpeg,image/png,image/webp";
 const AUDIO_ACCEPT = "audio/*,.mp3,.m4a,.wav,.aac,.ogg";
 
@@ -35,6 +44,7 @@ export default function Editor({ id }: { id: string }) {
   const [missing, setMissing] = useState(false);
   const [uploading, setUploading] = useState<{ key: string; pct: number } | null>(null);
   const [autoSubtitle, setAutoSubtitle] = useState(true);
+  const uploadAbort = useRef<AbortController | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -82,26 +92,44 @@ export default function Editor({ id }: { id: string }) {
   async function upload(kind: "clip" | "voice" | "narration", scene: number, file: File) {
     if (dirty) { notify("Save your changes first, then upload.", "error"); return; }
     const key = `${kind}-${scene}`;
+    const controller = new AbortController();
+    uploadAbort.current = controller;
+    let sent: { token: string; chunks: number } | null = null;
     setUploading({ key, pct: 0 });
     try {
       const start = await api<{ token: string; chunkSize: number; chunks: number }>(`/api/agent/videos/${id}/upload`, post({ action: "start", kind, scene, name: file.name, size: file.size, type: file.type }));
+      sent = { token: start.token, chunks: start.chunks };
       for (let i = 0; i < start.chunks; i++) {
         const part = file.slice(i * start.chunkSize, (i + 1) * start.chunkSize);
         for (let attempt = 1; ; attempt++) {
-          const response = await fetch(`/api/agent/videos/${id}/upload?token=${start.token}&chunk=${i}`, { method: "PUT", headers: { "Content-Type": "application/octet-stream" }, body: part }).catch(() => null);
+          if (controller.signal.aborted) throw new DOMException("cancelled", "AbortError");
+          const response = await fetch(`/api/agent/videos/${id}/upload?token=${start.token}&chunk=${i}`, { method: "PUT", headers: { "Content-Type": "application/octet-stream" }, body: part, signal: controller.signal }).catch((error) => { if (controller.signal.aborted) throw error; return null; });
           if (response?.ok) break;
           if (attempt >= 3) throw new Error(((await response?.json().catch(() => ({}))) as { error?: string } | undefined)?.error ?? "Upload interrupted — check your connection and try again.");
           await new Promise((resolve) => setTimeout(resolve, 1200 * attempt));
         }
         setUploading({ key, pct: Math.round(((i + 1) / start.chunks) * 88) });
       }
+      if (controller.signal.aborted) throw new DOMException("cancelled", "AbortError");
+      uploadAbort.current = null; // from here the server is adjusting the file — too late to cancel, but you can Remove it after
       setUploading({ key, pct: 94 });
       const done = await api<{ video: AgentVideo; note: string }>(`/api/agent/videos/${id}/upload`, post({ action: "finish", token: start.token, chunks: start.chunks, name: file.name, type: file.type, subtitle: autoSubtitle }));
       setVideo(done.video); setDraft(done.video.story); setSettings(done.video.settings);
       notify(done.note || "Uploaded.");
       void refresh(true);
-    } catch (error) { notify(error instanceof Error ? error.message : "Upload failed.", "error"); }
-    finally { setUploading(null); }
+    } catch (error) {
+      if (controller.signal.aborted) {
+        notify("Upload cancelled — nothing was changed.");
+        // Throw away the parts that were already sent.
+        if (sent) void fetch(`/api/agent/videos/${id}/upload`, post({ action: "cancel", token: sent.token, chunks: sent.chunks })).catch(() => undefined);
+      } else notify(error instanceof Error ? error.message : "Upload failed.", "error");
+    }
+    finally { uploadAbort.current = null; setUploading(null); }
+  }
+  /** Removes one upload (or all of one kind) after asking — the file is deleted. */
+  function removeUpload(kind: "clip" | "voice", scene: number | "all", question: string) {
+    if (!window.confirm(question)) return;
+    void uploadAction("remove", { kind, scene });
   }
   async function uploadAction(action: "remove" | "subtitle", extra: Record<string, unknown>) {
     if (dirty) { notify("Save your changes first.", "error"); return; }
@@ -137,6 +165,8 @@ export default function Editor({ id }: { id: string }) {
   const job = video.job;
   const assetsFor = (index: number) => (video.assets ?? []).filter((a) => a.sceneIndex === index);
   const needsRecompose = video.hasFinal && video.workflow !== "published";
+  const myClips = (video.assets ?? []).filter((a) => a.kind === "clip" && a.status === "done" && a.provider === "upload").length;
+  const myVoices = (video.assets ?? []).filter((a) => a.kind === "voice" && a.status === "done" && a.provider === "upload").length;
 
   return (
     <div>
@@ -234,7 +264,14 @@ export default function Editor({ id }: { id: string }) {
                       <label className="flex items-center gap-1.5 text-[11px] text-dim"><input type="checkbox" checked={autoSubtitle} onChange={(e) => setAutoSubtitle(e.target.checked)} className="accent-lime" /> Write subtitles from my audio</label>
                     </div>
                     <p className="mt-1.5 text-[10px] text-dim">A full narration is cut into one piece per scene at natural pauses. Limits: clip 120 MB (first 60 s used), voice 40 MB, full narration 80 MB.</p>
-                    {uploading && <div className="mt-2"><Progress value={uploading.pct} /><p className="mt-1 text-[10px] text-dim">{uploading.pct < 90 ? "Uploading…" : "Adjusting your file (fit, trim, level)…"} keep this page open.</p></div>}
+                    {(myClips > 0 || myVoices > 0) && (
+                      <div className="mt-2 flex flex-wrap items-center gap-2 border-t border-white/[0.06] pt-2 text-[11px] text-dim">
+                        <span>Your uploads in this video: {myClips} picture{myClips === 1 ? "" : "s"}, {myVoices} recording{myVoices === 1 ? "" : "s"}.</span>
+                        {myVoices > 0 && <button type="button" disabled={busy !== null || uploading !== null} onClick={() => removeUpload("voice", "all", `Remove all ${myVoices} of your recordings? The AI voice will read those scenes on the next render.`)} className="inline-flex h-7 items-center gap-1 rounded-lg border border-red-400/40 px-2 font-bold text-red-300 hover:bg-red-400/10 disabled:opacity-50"><X className="h-3 w-3" /> Remove all my recordings</button>}
+                        {myClips > 0 && <button type="button" disabled={busy !== null || uploading !== null} onClick={() => removeUpload("clip", "all", `Remove all ${myClips} of your clips and images? AI will make those pictures on the next render.`)} className="inline-flex h-7 items-center gap-1 rounded-lg border border-red-400/40 px-2 font-bold text-red-300 hover:bg-red-400/10 disabled:opacity-50"><X className="h-3 w-3" /> Remove all my pictures</button>}
+                      </div>
+                    )}
+                    {uploading && <div className="mt-2"><Progress value={uploading.pct} /><p className="mt-1 text-[10px] text-dim">{uploading.pct < 90 ? "Uploading…" : "Adjusting your file (fit, trim, level)…"} keep this page open.{uploading.pct < 94 && <button type="button" onClick={() => uploadAbort.current?.abort()} className="ml-2 font-bold text-red-300 underline">Cancel upload</button>}</p></div>}
                   </div>
                 )}
                 {draft.scenes.map((scene) => {
@@ -263,20 +300,32 @@ export default function Editor({ id }: { id: string }) {
                       {/* picture: your own clip/image, or AI */}
                       <div className="mt-3 rounded-xl border border-white/[0.06] bg-void/40 p-2.5">
                         <p className="mb-2 flex items-center gap-1.5 text-[11px] font-semibold text-mute"><ImageIcon className="h-3.5 w-3.5" /> Picture {clipMine && <span className="rounded bg-lime/15 px-1.5 py-0.5 text-[10px] font-bold text-lime">yours{clip?.meta?.trimmed ? " · first 60s" : ""}</span>}</p>
+                        {clipMine && clip && (
+                          <div className="mb-2 flex items-center gap-2 rounded-lg border border-lime/20 bg-lime/[0.04] p-1.5">
+                            <div className="h-12 w-12 shrink-0 overflow-hidden rounded-md bg-ink">
+                              {clip.mode === "image"
+                                ? <img src={fileUrl(video.id, "clip", `&scene=${scene.index}&v=${encodeURIComponent(clip.updatedAt)}`)} alt="" className="h-full w-full object-cover" />
+                                : <video muted playsInline preload="metadata" src={`${fileUrl(video.id, "clip", `&scene=${scene.index}&v=${encodeURIComponent(clip.updatedAt)}`)}#t=0.5`} className="h-full w-full object-cover" />}
+                            </div>
+                            <p className="min-w-0 flex-1 truncate text-[11px] text-cream">{String(clip.meta?.name ?? (clip.mode === "image" ? "Your image" : "Your clip"))}<span className="block text-[10px] text-dim">{clip.mode === "image" ? "image" : `video · ${Number(clip.meta?.duration ?? 0).toFixed(1)}s`}</span></p>
+                            {editable && <RemoveX label={`Remove your ${clip.mode === "image" ? "image" : "clip"} from scene ${scene.index + 1}`} disabled={busy !== null || uploading !== null} onClick={() => removeUpload("clip", scene.index, `Remove your ${clip.mode === "image" ? "image" : "clip"} from scene ${scene.index + 1}? You can upload another one, or AI makes the picture on the next render.`)} />}
+                          </div>
+                        )}
                         <div className="flex flex-wrap items-center gap-2">
                           {editable && <FilePick accept={CLIP_ACCEPT} disabled={uploading !== null || busy !== null} busy={upClip} onPick={(file) => void upload("clip", scene.index, file)}>{upClip ? `Uploading ${uploading!.pct}%` : clipMine ? "Replace my clip / image" : "Upload my clip / image"}</FilePick>}
-                          {editable && clipMine && <Button variant="ghost" disabled={busy !== null || uploading !== null} onClick={() => void uploadAction("remove", { kind: "clip", scene: scene.index })} className="h-8 text-[11px]">Use AI instead</Button>}
+                          {upClip && uploading!.pct < 94 && <button type="button" onClick={() => uploadAbort.current?.abort()} className="inline-flex h-8 items-center gap-1 rounded-xl border border-red-400/40 px-2.5 text-[11px] font-bold text-red-300 hover:bg-red-400/10"><X className="h-3.5 w-3.5" /> Cancel</button>}
                           {!running && editable && !clipMine && <Button variant="outline" disabled={busy !== null || dirty !== null} onClick={() => void act("regenerate-scene", { scene: scene.index }, `Regenerating scene ${scene.index + 1}.`)} className="h-8 text-[11px]"><RotateCcw className="h-3 w-3" /> Regenerate with AI</Button>}
                         </div>
                       </div>
                       {/* voice: your own recording, or AI */}
                       <div className="mt-2 rounded-xl border border-white/[0.06] bg-void/40 p-2.5">
-                        <p className="mb-2 flex items-center gap-1.5 text-[11px] font-semibold text-mute"><AudioLines className="h-3.5 w-3.5" /> Voice {voiceMine && <span className="rounded bg-lime/15 px-1.5 py-0.5 text-[10px] font-bold text-lime">yours · {Number(voice?.meta?.duration ?? 0).toFixed(1)}s</span>}</p>
+                        <p className="mb-2 flex items-center gap-1.5 text-[11px] font-semibold text-mute"><AudioLines className="h-3.5 w-3.5" /> Voice {voiceMine && <span className="max-w-[60%] truncate rounded bg-lime/15 px-1.5 py-0.5 text-[10px] font-bold text-lime">yours · {Number(voice?.meta?.duration ?? 0).toFixed(1)}s{voice?.meta?.name ? ` · ${String(voice.meta.name)}` : ""}</span>}</p>
                         <div className="flex flex-wrap items-center gap-2">
                           {voice?.status === "done" && <audio controls preload="none" src={fileUrl(video.id, "voice", `&scene=${scene.index}&v=${encodeURIComponent(voice.updatedAt)}`)} className="h-8 max-w-[220px]" />}
                           {editable && <FilePick accept={AUDIO_ACCEPT} disabled={uploading !== null || busy !== null} busy={upVoice} onPick={(file) => void upload("voice", scene.index, file)}>{upVoice ? `Uploading ${uploading!.pct}%` : voiceMine ? "Replace my recording" : "Upload my voice"}</FilePick>}
                           {editable && voiceMine && <Button variant="outline" disabled={busy !== null || uploading !== null} onClick={() => void uploadAction("subtitle", { scene: scene.index })} className="h-8 text-[11px]"><PenLine className="h-3 w-3" /> Auto-subtitle</Button>}
-                          {editable && voiceMine && <Button variant="ghost" disabled={busy !== null || uploading !== null} onClick={() => void uploadAction("remove", { kind: "voice", scene: scene.index })} className="h-8 text-[11px]">Use AI voice</Button>}
+                          {upVoice && uploading!.pct < 94 && <button type="button" onClick={() => uploadAbort.current?.abort()} className="inline-flex h-8 items-center gap-1 rounded-xl border border-red-400/40 px-2.5 text-[11px] font-bold text-red-300 hover:bg-red-400/10"><X className="h-3.5 w-3.5" /> Cancel</button>}
+                          {editable && voiceMine && <RemoveX label={`Remove your recording from scene ${scene.index + 1}`} disabled={busy !== null || uploading !== null} onClick={() => removeUpload("voice", scene.index, `Remove your recording from scene ${scene.index + 1}? You can upload another one, or the AI voice reads the text on the next render.`)} />}
                           {!running && editable && !voiceMine && !clipMine && <Button variant="ghost" disabled={busy !== null || dirty !== null} onClick={() => void act("regenerate-scene", { scene: scene.index, voice: true }, `Regenerating scene ${scene.index + 1} + voice.`)} className="h-8 text-[11px]">Regenerate picture + voice</Button>}
                         </div>
                       </div>

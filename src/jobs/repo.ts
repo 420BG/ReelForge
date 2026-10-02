@@ -414,6 +414,20 @@ export async function resetAssets(videoId: string, sceneIndexes: number[], kinds
   );
 }
 
+/**
+ * Removes files YOU uploaded (never AI-made ones) so those scenes are made by AI on the next render.
+ * `scenes` null = every scene. Returns the storage keys to delete and how many assets were cleared.
+ */
+export async function removeUploads(videoId: string, kinds: string[], scenes: number[] | null) {
+  const rows = await q<{ path: string | null; kind: string; scene_index: number }>(
+    `UPDATE agent_scene_assets SET status='pending', provider=NULL, attempts=0, error=NULL, provider_ref=NULL, next_attempt_at=NULL, updated_at=now()
+     WHERE video_id=$1 AND provider='upload' AND kind = ANY($2::text[]) AND ($3::boolean OR scene_index = ANY($4::int[]))
+     RETURNING path, kind, scene_index`,
+    [videoId, kinds, scenes === null, scenes ?? []],
+  );
+  return { count: rows.filter((row) => row.kind !== "keyframe").length, paths: Array.from(new Set(rows.map((row) => row.path).filter((path): path is string => Boolean(path)))) };
+}
+
 /** A waiting job (e.g. paused because free AI is out of quota) continues right away — used after you upload a file. */
 export async function wakeJob(videoId: string) {
   await q("UPDATE agent_jobs SET next_run_at = now() WHERE video_id = $1 AND state IN ('queued','waiting')", [videoId]);
