@@ -19,8 +19,8 @@ export async function validateFinal(file: string, opts: { maxDuration: number; e
   if (!info.hasAudio) errors.push("No audio stream.");
   else if (info.audioCodec !== "aac") warnings.push(`Audio codec is ${info.audioCodec}.`);
   if (info.duration < 3) errors.push("Video is shorter than 3 seconds.");
-  if (opts.format !== "long" && info.duration > 180) errors.push("Video is longer than YouTube's 3-minute Shorts limit.");
-  else if (info.duration > opts.maxDuration + 1) warnings.push(`Duration ${info.duration.toFixed(1)}s is above the ${opts.maxDuration}s target.`);
+  if (opts.format !== "long" && info.duration > 180) warnings.push("Longer than 3 minutes: YouTube will treat this as a normal video, not a Short.");
+  if (info.duration > opts.maxDuration + 1) warnings.push(`Duration ${info.duration.toFixed(1)}s is above the ${opts.maxDuration}s target.`);
   if (!opts.expectAudio) warnings.push("No narration: the video has music/SFX only.");
   if (sizeBytes > 250_000_000) warnings.push("File is larger than 250 MB.");
   return { ok: errors.length === 0, errors, warnings, duration: info.duration, width: info.width, height: info.height, sizeBytes };

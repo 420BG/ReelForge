@@ -55,7 +55,14 @@ export type ComposeInput = {
   dims?: Dims;
   /** Long videos render in parts: music + loudness are applied once over the joined parts instead. */
   partMode?: boolean;
+  /** Ceiling for the video bitrate (kbit/s) so the finished file fits the storage file-size limit. */
+  videoKbps?: number;
+  /** Audio bitrate (kbit/s); default 192. */
+  audioKbps?: number;
 };
+
+/** Captions are laid out for 1080p and scaled by libass, so they look the same at any output size. */
+const designDims = (dims: Dims) => (dims.width > dims.height ? { width: 1920, height: 1080 } : { width: 1080, height: 1920 });
 
 export type TimelineEntry = { index: number; start: number; length: number; transitionOut: number; voiceStart: number; voiceDuration: number };
 
@@ -119,7 +126,9 @@ async function renderSegment(scene: ComposeScene, length: number, grade: string,
     if (overlay.input) args.push(...overlay.input);
     graph = `[0:v]scale=${bigW}:${bigH}:force_original_aspect_ratio=increase,crop=${bigW}:${bigH},${motion},setsar=1[moved];${overlay.filter};[wx]${post || "null"},format=yuv420p[v]`;
   }
-  args.push("-filter_complex", graph, "-map", "[v]", "-t", length.toFixed(3), "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-maxrate", "10M", "-bufsize", "20M", "-pix_fmt", "yuv420p", "-r", String(OUTPUT.fps), out);
+  // Intermediate file: high quality, but never bigger than ~36 MB (storage accepts 50 MB per file on free plans).
+  const segKbps = Math.max(600, Math.min(10_000, Math.floor((36_000 * 8) / Math.max(1, length))));
+  args.push("-filter_complex", graph, "-map", "[v]", "-t", length.toFixed(3), "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-maxrate", `${segKbps}k`, "-bufsize", `${segKbps * 2}k`, "-pix_fmt", "yuv420p", "-r", String(OUTPUT.fps), out);
   await runFfmpeg(args, 270_000);
 }
 
@@ -190,7 +199,7 @@ export async function composeFinal(input: FinalInput): Promise<ComposeResult> {
     duration: scene.voiceFile ? entries[i].voiceDuration : Math.max(1, entries[i].length - entries[i].transitionOut - 0.3),
   }));
   const hookUntil = Math.min(2.8, entries[0].length - 0.1);
-  await writeFile(path.join(workDir, "captions.ass"), input.captionsEnabled ? buildAss(cues, input.captions, family, { text: input.hookText, until: hookUntil }, OUTPUT) : buildAss([], { ...input.captions, hookTitle: false }, family, undefined, OUTPUT));
+  await writeFile(path.join(workDir, "captions.ass"), input.captionsEnabled ? buildAss(cues, input.captions, family, { text: input.hookText, until: hookUntil }, designDims(OUTPUT)) : buildAss([], { ...input.captions, hookTitle: false }, family, undefined, designDims(OUTPUT)));
 
   // 3) Audio stems
   const audioInputs: { file: string; delay: number; role: "voice" | "music" | "sfx"; volume: number }[] = [];
@@ -268,12 +277,14 @@ export async function composeFinal(input: FinalInput): Promise<ComposeResult> {
   else graph.push(`anullsrc=r=48000:cl=stereo,atrim=0:${total.toFixed(3)}[aout]`);
 
   const fast = input.quality === "draft" || Boolean(process.env.VERCEL);
-  const preset = input.quality === "draft" ? ["-preset", "veryfast", "-crf", "24", "-maxrate", "4M", "-bufsize", "8M"] : [ "-preset", fast ? "veryfast" : "medium", "-crf", "20", "-maxrate", "4800k", "-bufsize", "9600k"];
+  // The bitrate ceiling keeps the finished file inside the storage size limit (long videos get a lower ceiling).
+  const ceiling = Math.max(150, Math.min(input.quality === "draft" ? 4000 : 4800, Math.floor(input.videoKbps ?? Infinity)));
+  const preset = ["-preset", fast ? "veryfast" : "medium", "-crf", input.quality === "draft" ? "24" : "20", "-maxrate", `${ceiling}k`, "-bufsize", `${ceiling * 2}k`];
   args.push(
     "-filter_complex", graph.join(";"),
     "-map", "[vout]", "-map", "[aout]",
     "-c:v", "libx264", ...preset, "-profile:v", "high", "-pix_fmt", "yuv420p", "-r", String(OUTPUT.fps),
-    "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+    "-c:a", "aac", "-b:a", `${input.audioKbps ?? 192}k`, "-ar", "48000",
     "-t", total.toFixed(3), "-movflags", "+faststart", path.resolve(input.outFile),
   );
   await runFfmpeg(args.map((arg) => (arg.startsWith(workDir) ? path.relative(workDir, arg) : arg)), 280_000, workDir);
@@ -281,7 +292,7 @@ export async function composeFinal(input: FinalInput): Promise<ComposeResult> {
   // 5) Cover image: first scene frame + title
   if (!input.coverFile) return { duration: total, warnings, timeline: entries };
   try {
-    const coverAss = buildAss([], { ...input.captions, hookTitle: true, size: 104 }, family, { text: input.coverTitle, until: 5 }, OUTPUT).replace(/,(250|90),1\n/, `,${Math.round(OUTPUT.height * 0.375)},1\n`);
+    const coverAss = buildAss([], { ...input.captions, hookTitle: true, size: 104 }, family, { text: input.coverTitle, until: 5 }, designDims(OUTPUT)).replace(/,(250|90),1\n/, `,${Math.round(designDims(OUTPUT).height * 0.375)},1\n`);
     await writeFile(path.join(workDir, "cover.ass"), coverAss);
     await runFfmpeg(["-i", path.relative(workDir, segments[0]), "-ss", Math.min(1.2, entries[0].length / 2).toFixed(2), "-frames:v", "1", "-vf", "ass=cover.ass:fontsdir=fonts", "-q:v", "3", path.resolve(input.coverFile)], 60_000, workDir);
   } catch (error) {
@@ -309,28 +320,30 @@ export async function compose(input: ComposeInput): Promise<ComposeResult> {
  * continuous generated music bed under the whole thing (ducked under the voice) and normalises loudness.
  * Audio-only processing, so it stays fast even for 10+ minute videos.
  */
-export async function assembleParts(input: { workDir: string; parts: string[]; musicMood: MusicMood | null; musicVolume: number; outFile: string; onProgress?: (label: string) => Promise<void> | void }) {
+export async function assembleParts(input: { workDir: string; parts: string[]; musicMood: MusicMood | null; musicVolume: number; outFile: string; audioKbps?: number; onProgress?: (label: string) => Promise<void> | void }) {
   const { workDir } = input;
   const list = path.join(workDir, "parts.txt");
   await writeFile(list, input.parts.map((file) => `file '${path.resolve(file).replace(/'/g, "'\\''")}'`).join("\n"));
-  const joined = path.join(workDir, "joined.mp4");
-  await input.onProgress?.("Joining parts");
-  await runFfmpeg(["-f", "concat", "-safe", "0", "-i", list, "-c", "copy", "-movflags", "+faststart", joined], 280_000, workDir);
-  const info = await probe(joined);
-  const total = info.duration;
-  const args = ["-i", joined];
+  // One pass straight from the parts into the final file (no joined copy on disk): the scratch disk on
+  // serverless is small, and a long video must not need three copies of itself.
+  let total = 0;
+  for (const file of input.parts) total += (await probe(file)).duration;
+  const args = ["-f", "concat", "-safe", "0", "-i", list];
   let graph: string;
   if (input.musicMood && input.musicVolume > 0) {
-    await input.onProgress?.("Music bed and loudness");
+    await input.onProgress?.("Joining parts, music bed and loudness");
     const licensed = await licensedMusic(input.musicMood);
+    // Generated music is rendered once (≤ 2 min) and looped, instead of one huge WAV for the whole video.
     const musicFile = licensed ?? path.join(workDir, "music.wav");
-    if (!licensed) await renderMusic(input.musicMood, total, musicFile);
+    if (!licensed) await renderMusic(input.musicMood, Math.min(total, 120), musicFile);
     args.push("-stream_loop", "-1", "-i", musicFile);
     const vol = ((input.musicVolume / 100) * 0.9).toFixed(3);
     graph = `[0:a]aresample=48000,asplit=2[main][sc];[1:a]aresample=48000,aformat=channel_layouts=stereo,atrim=0:${total.toFixed(3)},volume=${vol}[mus];[mus][sc]sidechaincompress=threshold=0.025:ratio=7:attack=15:release=350[duck];[main][duck]amix=inputs=2:normalize=0:duration=first,afade=t=out:st=${Math.max(0, total - 1.5).toFixed(3)}:d=1.5,loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[aout]`;
   } else {
+    await input.onProgress?.("Joining parts");
     graph = `[0:a]afade=t=out:st=${Math.max(0, total - 1.5).toFixed(3)}:d=1.5,loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[aout]`;
   }
-  await runFfmpeg([...args, "-filter_complex", graph, "-map", "0:v", "-map", "[aout]", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-t", total.toFixed(3), "-movflags", "+faststart", path.resolve(input.outFile)], 280_000, workDir);
-  return { duration: total };
+  await runFfmpeg([...args, "-filter_complex", graph, "-map", "0:v", "-map", "[aout]", "-c:v", "copy", "-c:a", "aac", "-b:a", `${input.audioKbps ?? 192}k`, "-ar", "48000", "-t", total.toFixed(3), "-movflags", "+faststart", path.resolve(input.outFile)], 280_000, workDir);
+  const info = await probe(path.resolve(input.outFile));
+  return { duration: info.duration || total };
 }

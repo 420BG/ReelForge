@@ -18,7 +18,7 @@ export async function generateVoiceStep(job: AgentJob, videoId: string, story: S
     for (const scene of story.scenes) if (voices.get(scene.index)?.status !== "done") await upsertAsset(videoId, scene.index, "voice", { status: "skipped", mode: "audio", error: null });
     const row = await getVideoRow(videoId);
     const warnings = Array.isArray(row?.warnings) ? (row!.warnings as string[]) : [];
-    const note = settings.voiceProvider === "none" ? "Narration turned off: captions and music only." : "No voice provider configured (POLLINATIONS_API_KEY or ELEVENLABS_API_KEY): captions and music only.";
+    const note = settings.voiceProvider === "none" ? "Narration turned off: captions and music only." : "No narration voice could be set up, so this render has captions and music only. Re-render to try again, or upload your own voice on the Scenes tab.";
     await updateVideo(videoId, { warnings: Array.from(new Set([...warnings, note])) });
     await logJob(job.id, "warn", note);
     return { state: "queued", step: "clips", progress: progressFor("voice", 1) };

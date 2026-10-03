@@ -2,7 +2,7 @@ import { hostname } from "node:os";
 import { randomBytes } from "node:crypto";
 import { claimJob, logJob, releaseJob, updateVideo } from "@/jobs/repo";
 import { runStep } from "@/jobs/video-generation/pipeline";
-import { clearScratch } from "@/video/storage";
+import { clearScratch, sweepStaleScratch } from "@/video/storage";
 
 /**
  * Job runner. One unit of work per claim, under a DB lease, so:
@@ -40,6 +40,7 @@ export async function tick(maxUnits = DEFAULT_UNITS, budgetMs = 20_000) {
         continue;
       }
       try {
+        if (SERVERLESS) await sweepStaleScratch(job.videoId);
         const outcome = await runStep(job);
         await releaseJob(job.id, {
           state: outcome.state,

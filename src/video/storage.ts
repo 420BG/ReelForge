@@ -1,4 +1,4 @@
-import { copyFile, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -58,6 +58,23 @@ export async function ensureScratch(videoId: string) {
 
 export async function clearScratch(videoId: string) {
   try { await rm(scratchDir(videoId), { recursive: true, force: true }); } catch { /* nothing to clear */ }
+}
+
+/**
+ * Serverless scratch space is small (~500 MB on Vercel) and can outlive a request in a warm instance.
+ * Removes other videos' scratch folders that nothing has touched for a while (e.g. left by a timed-out step).
+ */
+export async function sweepStaleScratch(keepVideoId: string, olderThanMs = 12 * 60_000) {
+  if (!process.env.VERCEL) return;
+  const root = path.join(tmpdir(), "agent");
+  try {
+    for (const name of await readdir(root)) {
+      if (name === keepVideoId) continue;
+      const dir = path.join(root, name);
+      const info = await stat(dir).catch(() => null);
+      if (info && Date.now() - info.mtimeMs > olderThanMs) await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  } catch { /* nothing to sweep */ }
 }
 
 export async function fileExists(file: string) {

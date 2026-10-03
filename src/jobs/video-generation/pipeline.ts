@@ -60,6 +60,27 @@ type Ctx = { job: AgentJob; videoId: string; story: StoryPlan | null; settings: 
 const isLong = (ctx: Ctx) => ctx.settings.format === "long";
 const aspectFor = (ctx: Ctx) => aspectOf(ctx.settings);
 
+/**
+ * Finished videos must fit the storage's per-file limit (Supabase Free: 50 MB). Default budget 46 MB;
+ * set AGENT_MAX_FINAL_MB higher if your storage plan allows bigger files.
+ */
+const maxFinalMb = () => Math.max(2, Math.min(2000, Number(process.env.AGENT_MAX_FINAL_MB) || 46));
+/** Bitrates that make a video of `seconds` fit the size budget (audio first, the rest to the picture). */
+function sizeBudget(seconds: number) {
+  const audioKbps = seconds > 420 ? 96 : seconds > 180 ? 128 : 192;
+  const totalKbps = (maxFinalMb() * 8000 * 0.97) / Math.max(10, seconds);
+  return { audioKbps, videoKbps: Math.max(150, Math.floor(totalKbps - audioKbps)) };
+}
+/**
+ * Output size. Normally 1080p; a long video that only gets a small bitrate (many minutes inside the
+ * size budget) is rendered at 720p instead, which looks much cleaner than a starved 1080p picture.
+ */
+function dimsOf(ctx: Ctx) {
+  const full = dimsFor(aspectFor(ctx));
+  if (!isLong(ctx) || sizeBudget(ctx.settings.targetDuration * 1.15).videoKbps >= 900) return full;
+  return full.width > full.height ? { ...full, width: 1280, height: 720 } : { ...full, width: 720, height: 1280 };
+}
+
 /* ---------------- story ---------------- */
 
 /** After the script is written: stop for review (Write script first) or go straight on to voice. */
@@ -328,7 +349,7 @@ async function audioStep(): Promise<StepOutcome> {
 }
 
 type PlannedScene = ComposeScene & { clipKey: string; clipStamp: string; voiceKey: string | null; clipMode: string | null; clipUploaded: boolean; voiceUploaded: boolean };
-type Group = { index: number; scenes: PlannedScene[]; entries: TimelineEntry[]; maxDuration: number };
+type Group = { index: number; scenes: PlannedScene[]; entries: TimelineEntry[]; maxDuration: number; total: number };
 
 /**
  * Longest a Short may run. AI narration is nudged to fit the length you picked; a recording YOU
@@ -385,15 +406,17 @@ async function composePlan(ctx: Ctx) {
     });
     [...byPart.entries()].sort((a, b) => a[0] - b[0]).forEach(([, list], index) => {
       const maxDuration = 60 * 20;
-      groups.push({ index, scenes: list, entries: planTimeline(list, maxDuration).entries, maxDuration });
+      const planned = planTimeline(list, maxDuration);
+      groups.push({ index, scenes: list, entries: planned.entries, maxDuration, total: planned.total });
     });
   } else {
     const maxDuration = shortCap(ctx, scenes);
-    groups.push({ index: 0, scenes, entries: planTimeline(scenes, maxDuration).entries, maxDuration });
+    const planned = planTimeline(scenes, maxDuration);
+    groups.push({ index: 0, scenes, entries: planned.entries, maxDuration, total: planned.total });
   }
   const lengthOf = new Map<number, number>();
   for (const group of groups) group.scenes.forEach((scene, k) => lengthOf.set(scene.index, group.entries[k].length));
-  return { scenes, clips, groups, lengthOf };
+  return { scenes, clips, groups, lengthOf, totalSeconds: groups.reduce((sum, group) => sum + group.total, 0) };
 }
 
 /** One scene segment per call. Re-renders only when its clip, length, size or look changed. */
@@ -401,7 +424,7 @@ async function segmentsStep(ctx: Ctx): Promise<StepOutcome> {
   const plan = await composePlan(ctx);
   if (!plan) return { state: "queued", step: "clips" };
   const niche = getNiche(ctx.story!.niche);
-  const dims = dimsFor(aspectFor(ctx));
+  const dims = dimsOf(ctx);
   const segments = new Map((await getAssets(ctx.videoId, "segment")).map((asset) => [asset.scene_index, asset]));
   const total = plan.scenes.length;
   for (const [i, scene] of plan.scenes.entries()) {
@@ -421,7 +444,8 @@ async function segmentsStep(ctx: Ctx): Promise<StepOutcome> {
   return { state: "queued", step: isLong(ctx) ? "parts" : "compose", progress: progressFor("segments", 1), currentScene: null };
 }
 
-async function renderGroup(ctx: Ctx, group: Group, outFile: string, coverFile: string, partMode: boolean) {
+async function renderGroup(ctx: Ctx, group: Group, outFile: string, coverFile: string, partMode: boolean, totalSeconds: number) {
+  const budget = sizeBudget(totalSeconds);
   const story = ctx.story!;
   const niche = getNiche(story.niche);
   const segmentAssets = new Map((await getAssets(ctx.videoId, "segment")).map((asset) => [asset.scene_index, asset]));
@@ -449,8 +473,10 @@ async function renderGroup(ctx: Ctx, group: Group, outFile: string, coverFile: s
     quality: ctx.settings.quality,
     maxDuration: group.maxDuration,
     outFile, coverFile,
-    dims: dimsFor(aspectFor(ctx)),
+    dims: dimsOf(ctx),
     partMode,
+    videoKbps: budget.videoKbps,
+    audioKbps: partMode ? 192 : budget.audioKbps, // parts are re-mixed once at the end; keep their audio clean
     onProgress: async (label) => { await extendLease(ctx.job.id, 330); await logJob(ctx.job.id, "info", `${partMode ? `Part ${group.index + 1}: ` : ""}${label}`); },
   });
 }
@@ -462,13 +488,13 @@ async function partsStep(ctx: Ctx): Promise<StepOutcome> {
   const parts = new Map((await getAssets(ctx.videoId, "part")).map((asset) => [asset.scene_index, asset]));
   const segmentAssets = new Map((await getAssets(ctx.videoId, "segment")).map((asset) => [asset.scene_index, asset]));
   for (const group of plan.groups) {
-    const signature = group.scenes.map((scene) => `${scene.index}:${segmentAssets.get(scene.index)?.meta?.signature ?? ""}:${scene.voiceKey ?? ""}`).join("|");
+    const signature = `${group.scenes.map((scene) => `${scene.index}:${segmentAssets.get(scene.index)?.meta?.signature ?? ""}:${scene.voiceKey ?? ""}`).join("|")}|${sizeBudget(plan.totalSeconds).videoKbps}k`;
     const existing = parts.get(group.index);
     if (existing?.status === "done" && existing.meta?.signature === signature && (await storedLooksPresent(existing.path))) continue;
     const scratch = await ensureScratch(ctx.videoId);
     const outFile = path.join(scratch, `part-${group.index}.mp4`);
     const coverFile = group.index === 0 ? path.join(scratch, "cover.jpg") : "";
-    const result = await renderGroup(ctx, group, outFile, coverFile, true);
+    const result = await renderGroup(ctx, group, outFile, coverFile, true, plan.totalSeconds);
     if (!result) return { state: "queued", step: "segments" };
     await putFile(storageKey.part(ctx.videoId, group.index), outFile);
     if (coverFile && (await fileExists(coverFile))) { await putFile(storageKey.cover(ctx.videoId), coverFile); await updateVideo(ctx.videoId, { cover_path: storageKey.cover(ctx.videoId) }); }
@@ -487,7 +513,7 @@ async function composeStep(ctx: Ctx): Promise<StepOutcome> {
   const scratch = await ensureScratch(ctx.videoId);
   const outFile = path.join(scratch, "final.mp4");
   const coverFile = path.join(scratch, "cover.jpg");
-  const dims = dimsFor(aspectFor(ctx));
+  const dims = dimsOf(ctx);
   let duration: number;
   let composeWarnings: string[] = [];
   let hasCover = false;
@@ -504,12 +530,12 @@ async function composeStep(ctx: Ctx): Promise<StepOutcome> {
     await logJob(ctx.job.id, "info", `Joining ${files.length} parts, adding the music bed and mastering loudness…`);
     const workDir = path.join(scratch, "final");
     await mkdir(workDir, { recursive: true });
-    const result = await assembleParts({ workDir, parts: files, musicMood: ctx.settings.music ? story.musicMood : null, musicVolume: ctx.settings.musicVolume, outFile, onProgress: async (label) => { await extendLease(ctx.job.id, 330); await logJob(ctx.job.id, "info", label); } });
+    const result = await assembleParts({ workDir, parts: files, musicMood: ctx.settings.music ? story.musicMood : null, musicVolume: ctx.settings.musicVolume, outFile, audioKbps: sizeBudget(plan.totalSeconds).audioKbps, onProgress: async (label) => { await extendLease(ctx.job.id, 330); await logJob(ctx.job.id, "info", label); } });
     duration = result.duration;
     hasCover = await storedLooksPresent(storageKey.cover(ctx.videoId));
   } else {
     await logJob(ctx.job.id, "info", "Final edit: transitions, captions, voice, music and SFX…");
-    const result = await renderGroup(ctx, plan.groups[0], outFile, coverFile, false);
+    const result = await renderGroup(ctx, plan.groups[0], outFile, coverFile, false, plan.totalSeconds);
     if (!result) return { state: "queued", step: "segments" };
     duration = result.duration;
     composeWarnings = result.warnings;

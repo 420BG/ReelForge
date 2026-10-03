@@ -123,8 +123,13 @@ export async function planVoice(settings: VideoSettings, niche: NicheDefinition)
     const voiceId = settings.voiceId && /^[a-z]{2}_[a-z]+$/.test(settings.voiceId) ? settings.voiceId : KOKORO[style][gender];
     return { provider, voiceId, style, gender, pace: niche.voice.pace };
   }
-  const voiceId = settings.voiceId && /^[a-zA-Z0-9_-]{8,80}$/.test(settings.voiceId) && !/^[a-z]{2}_[a-z]+$/.test(settings.voiceId) ? settings.voiceId : await elevenVoiceFor(gender);
-  return { provider, voiceId, style, gender, pace: niche.voice.pace };
+  try {
+    const voiceId = settings.voiceId && /^[a-zA-Z0-9_-]{8,80}$/.test(settings.voiceId) && !/^[a-z]{2}_[a-z]+$/.test(settings.voiceId) ? settings.voiceId : await elevenVoiceFor(gender);
+    return { provider, voiceId, style, gender, pace: niche.voice.pace };
+  } catch {
+    // ElevenLabs key is invalid / out of credits / unreachable: narrate with the free voices instead of going silent.
+    return { provider: "free", voiceId: FREE_VOICES[style][gender], style, gender, pace: niche.voice.pace };
+  }
 }
 
 async function fetchVoice(plan: VoicePlan, text: string, voiceId: string, workFile: string): Promise<Buffer> {
